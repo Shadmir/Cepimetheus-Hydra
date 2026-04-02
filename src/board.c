@@ -1,0 +1,426 @@
+#include "board.h"
+
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int file_of(int square) {
+    return square & 7;
+}
+
+static int rank_of(int square) {
+    return square >> 3;
+}
+
+static int piece_index_for_char(char piece_char) {
+    switch (piece_char) {
+        case 'P': return WHITE_PAWN;
+        case 'N': return WHITE_KNIGHT;
+        case 'B': return WHITE_BISHOP;
+        case 'R': return WHITE_ROOK;
+        case 'Q': return WHITE_QUEEN;
+        case 'K': return WHITE_KING;
+        case 'p': return BLACK_PAWN;
+        case 'n': return BLACK_KNIGHT;
+        case 'b': return BLACK_BISHOP;
+        case 'r': return BLACK_ROOK;
+        case 'q': return BLACK_QUEEN;
+        case 'k': return BLACK_KING;
+        default: return -1;
+    }
+}
+
+static int promotion_piece(int side, int promotion) {
+    switch (promotion) {
+        case MOVE_PROMO_KNIGHT: return side == WHITE ? WHITE_KNIGHT : BLACK_KNIGHT;
+        case MOVE_PROMO_BISHOP: return side == WHITE ? WHITE_BISHOP : BLACK_BISHOP;
+        case MOVE_PROMO_ROOK: return side == WHITE ? WHITE_ROOK : BLACK_ROOK;
+        case MOVE_PROMO_QUEEN: return side == WHITE ? WHITE_QUEEN : BLACK_QUEEN;
+        default: return -1;
+    }
+}
+
+static int rook_from_castle_square(int side, int to_square) {
+    if (side == WHITE) {
+        return to_square == 6 ? 7 : 0;
+    }
+    return to_square == 62 ? 63 : 56;
+}
+
+static int rook_to_castle_square(int side, int to_square) {
+    if (side == WHITE) {
+        return to_square == 6 ? 5 : 3;
+    }
+    return to_square == 62 ? 61 : 59;
+}
+
+static void board_sync_occupancy(Board *board) {
+    board->occupancy[WHITE] = 0;
+    board->occupancy[BLACK] = 0;
+    for (int piece = 0; piece < PIECE_NB; ++piece) {
+        if (piece < BLACK_PAWN) {
+            board->occupancy[WHITE] |= board->pieces[piece];
+        } else {
+            board->occupancy[BLACK] |= board->pieces[piece];
+        }
+    }
+    board->occupancy[BOTH] = board->occupancy[WHITE] | board->occupancy[BLACK];
+}
+
+static void board_sync_kings(Board *board) {
+    U64 white_king = board->pieces[WHITE_KING];
+    U64 black_king = board->pieces[BLACK_KING];
+    board->king_square[WHITE] = white_king ? bitboard_pop_lsb(&white_king) : -1;
+    board->king_square[BLACK] = black_king ? bitboard_pop_lsb(&black_king) : -1;
+}
+
+void board_clear(Board *board) {
+    memset(board, 0, sizeof(*board));
+    board->ep_square = -1;
+    board->fullmove_number = 1;
+    board->king_square[WHITE] = -1;
+    board->king_square[BLACK] = -1;
+}
+
+void board_init(Board *board) {
+    bitboard_init_tables();
+    board_clear(board);
+    board_set_startpos(board);
+}
+
+void board_set_startpos(Board *board) {
+    board_set_fen(board, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+}
+
+int board_piece_color(int piece) {
+    if (piece < 0) {
+        return -1;
+    }
+    return piece < BLACK_PAWN ? WHITE : BLACK;
+}
+
+int board_piece_type(int piece) {
+    if (piece < 0) {
+        return -1;
+    }
+    return piece % 6;
+}
+
+int board_piece_at(const Board *board, int square) {
+    U64 mask = 1ULL << square;
+    for (int piece = 0; piece < PIECE_NB; ++piece) {
+        if (board->pieces[piece] & mask) {
+            return piece;
+        }
+    }
+    return -1;
+}
+
+int board_parse_square(const char *text) {
+    if (text == NULL || strlen(text) < 2) {
+        return -1;
+    }
+    int file = tolower((unsigned char)text[0]) - 'a';
+    int rank = text[1] - '1';
+    if (file < 0 || file > 7 || rank < 0 || rank > 7) {
+        return -1;
+    }
+    return rank * 8 + file;
+}
+
+void board_square_to_string(int square, char buffer[3]) {
+    buffer[0] = (char)('a' + file_of(square));
+    buffer[1] = (char)('1' + rank_of(square));
+    buffer[2] = '\0';
+}
+
+static bool board_parse_fen_piece_placement(Board *board, const char *placement) {
+    int rank = 7;
+    int file = 0;
+
+    for (const char *cursor = placement; *cursor; ++cursor) {
+        char c = *cursor;
+        if (c == '/') {
+            --rank;
+            file = 0;
+            if (rank < 0) {
+                return false;
+            }
+            continue;
+        }
+        if (isdigit((unsigned char)c)) {
+            file += c - '0';
+            if (file > 8) {
+                return false;
+            }
+            continue;
+        }
+        int piece = piece_index_for_char(c);
+        if (piece < 0 || file > 7 || rank < 0) {
+            return false;
+        }
+        int square = rank * 8 + file;
+        board->pieces[piece] |= 1ULL << square;
+        if (piece == WHITE_KING) {
+            board->king_square[WHITE] = square;
+        } else if (piece == BLACK_KING) {
+            board->king_square[BLACK] = square;
+        }
+        ++file;
+        if (file > 8) {
+            return false;
+        }
+    }
+
+    return rank == 0 && file == 8;
+}
+
+bool board_set_fen(Board *board, const char *fen) {
+    if (board == NULL || fen == NULL) {
+        return false;
+    }
+
+    char fen_copy[512];
+    if (strlen(fen) >= sizeof(fen_copy)) {
+        return false;
+    }
+
+    strcpy(fen_copy, fen);
+    board_clear(board);
+
+    char *tokens[6] = {0};
+    int token_count = 0;
+    for (char *token = strtok(fen_copy, " \t\r\n"); token != NULL && token_count < 6; token = strtok(NULL, " \t\r\n")) {
+        tokens[token_count++] = token;
+    }
+
+    if (token_count < 4) {
+        return false;
+    }
+
+    if (!board_parse_fen_piece_placement(board, tokens[0])) {
+        return false;
+    }
+
+    if (strcmp(tokens[1], "w") == 0) {
+        board->side = WHITE;
+    } else if (strcmp(tokens[1], "b") == 0) {
+        board->side = BLACK;
+    } else {
+        return false;
+    }
+
+    if (strcmp(tokens[2], "-") != 0) {
+        if (strchr(tokens[2], 'K') != NULL) {
+            board->castling_rights |= CASTLE_WHITE_KING;
+        }
+        if (strchr(tokens[2], 'Q') != NULL) {
+            board->castling_rights |= CASTLE_WHITE_QUEEN;
+        }
+        if (strchr(tokens[2], 'k') != NULL) {
+            board->castling_rights |= CASTLE_BLACK_KING;
+        }
+        if (strchr(tokens[2], 'q') != NULL) {
+            board->castling_rights |= CASTLE_BLACK_QUEEN;
+        }
+    }
+
+    if (strcmp(tokens[3], "-") == 0) {
+        board->ep_square = -1;
+    } else {
+        board->ep_square = board_parse_square(tokens[3]);
+        if (board->ep_square < 0) {
+            return false;
+        }
+    }
+    if (board->ep_square >= 64) {
+        return false;
+    }
+
+    if (token_count >= 5) {
+        board->halfmove_clock = atoi(tokens[4]);
+    }
+    if (token_count >= 6) {
+        board->fullmove_number = atoi(tokens[5]);
+    }
+
+    board_sync_occupancy(board);
+    board_sync_kings(board);
+    return board->king_square[WHITE] >= 0 && board->king_square[BLACK] >= 0;
+}
+
+bool board_is_square_attacked(const Board *board, int square, int attacker_side) {
+    if (square < 0 || square >= 64) {
+        return false;
+    }
+
+    int file = file_of(square);
+    int rank = rank_of(square);
+
+    if (attacker_side == WHITE) {
+        if (file > 0 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (square - 9)))) {
+            return true;
+        }
+        if (file < 7 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (square - 7)))) {
+            return true;
+        }
+    } else {
+        if (file > 0 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (square + 7)))) {
+            return true;
+        }
+        if (file < 7 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (square + 9)))) {
+            return true;
+        }
+    }
+
+    if (bitboard_knight_attacks(square) & (attacker_side == WHITE ? board->pieces[WHITE_KNIGHT] : board->pieces[BLACK_KNIGHT])) {
+        return true;
+    }
+    if (bitboard_king_attacks(square) & (attacker_side == WHITE ? board->pieces[WHITE_KING] : board->pieces[BLACK_KING])) {
+        return true;
+    }
+
+    U64 bishops = attacker_side == WHITE ? (board->pieces[WHITE_BISHOP] | board->pieces[WHITE_QUEEN]) : (board->pieces[BLACK_BISHOP] | board->pieces[BLACK_QUEEN]);
+    U64 rooks = attacker_side == WHITE ? (board->pieces[WHITE_ROOK] | board->pieces[WHITE_QUEEN]) : (board->pieces[BLACK_ROOK] | board->pieces[BLACK_QUEEN]);
+    if (bitboard_bishop_attacks(square, board->occupancy[BOTH]) & bishops) {
+        return true;
+    }
+    if (bitboard_rook_attacks(square, board->occupancy[BOTH]) & rooks) {
+        return true;
+    }
+
+    return false;
+}
+
+bool board_is_in_check(const Board *board, int side) {
+    int king_square = board->king_square[side];
+    if (king_square < 0) {
+        return false;
+    }
+    return board_is_square_attacked(board, king_square, side ^ 1);
+}
+
+void board_unmake_move(Board *board, const Undo *undo) {
+    if (board != NULL && undo != NULL) {
+        *board = undo->snapshot;
+    }
+}
+
+static void remove_piece_at(Board *board, int piece, int square) {
+    board->pieces[piece] &= ~(1ULL << square);
+}
+
+static void add_piece_at(Board *board, int piece, int square) {
+    board->pieces[piece] |= 1ULL << square;
+}
+
+static int piece_for_side_at_type(int side, int type) {
+    return side == WHITE ? type : type + 6;
+}
+
+static void clear_castling_rights_for_square(Board *board, int square, int piece) {
+    if (piece == WHITE_KING) {
+        board->castling_rights &= ~(CASTLE_WHITE_KING | CASTLE_WHITE_QUEEN);
+        return;
+    }
+    if (piece == BLACK_KING) {
+        board->castling_rights &= ~(CASTLE_BLACK_KING | CASTLE_BLACK_QUEEN);
+        return;
+    }
+    if (piece == WHITE_ROOK) {
+        if (square == 0) {
+            board->castling_rights &= ~CASTLE_WHITE_QUEEN;
+        } else if (square == 7) {
+            board->castling_rights &= ~CASTLE_WHITE_KING;
+        }
+    } else if (piece == BLACK_ROOK) {
+        if (square == 56) {
+            board->castling_rights &= ~CASTLE_BLACK_QUEEN;
+        } else if (square == 63) {
+            board->castling_rights &= ~CASTLE_BLACK_KING;
+        }
+    }
+}
+
+bool board_make_move(Board *board, Move move, Undo *undo) {
+    if (board == NULL || undo == NULL) {
+        return false;
+    }
+
+    undo->snapshot = *board;
+
+    int from = move_from(move);
+    int to = move_to(move);
+    int promotion = move_promotion(move);
+    int flags = move_flags(move);
+    int side = board->side;
+    int mover_piece = board_piece_at(board, from);
+
+    if (mover_piece < 0 || board_piece_color(mover_piece) != side) {
+        return false;
+    }
+
+    int target_piece = board_piece_at(board, to);
+    int piece_type = board_piece_type(mover_piece);
+    int piece_to_move = mover_piece;
+    int captured_square = to;
+
+    remove_piece_at(board, mover_piece, from);
+
+    if (flags & MOVE_FLAG_EN_PASSANT) {
+        captured_square = side == WHITE ? to - 8 : to + 8;
+        int captured_piece = piece_for_side_at_type(side ^ 1, 0);
+        remove_piece_at(board, captured_piece, captured_square);
+    } else if (target_piece >= 0) {
+        remove_piece_at(board, target_piece, to);
+    }
+
+    if (flags & MOVE_FLAG_CASTLE) {
+        int rook_from = rook_from_castle_square(side, to);
+        int rook_to = rook_to_castle_square(side, to);
+        int rook_piece = piece_for_side_at_type(side, 3);
+        remove_piece_at(board, rook_piece, rook_from);
+        add_piece_at(board, rook_piece, rook_to);
+    }
+
+    if (piece_type == 0 && promotion != MOVE_PROMO_NONE) {
+        piece_to_move = promotion_piece(side, promotion);
+    }
+
+    add_piece_at(board, piece_to_move, to);
+
+    if (piece_type == 5) {
+        board->king_square[side] = to;
+    }
+
+    clear_castling_rights_for_square(board, from, mover_piece);
+    if (target_piece >= 0) {
+        clear_castling_rights_for_square(board, captured_square, target_piece);
+    }
+
+    board->ep_square = -1;
+    if ((flags & MOVE_FLAG_DOUBLE_PAWN) != 0) {
+        board->ep_square = side == WHITE ? from + 8 : from - 8;
+    }
+
+    if (piece_type == 0 || target_piece >= 0 || (flags & MOVE_FLAG_EN_PASSANT) != 0) {
+        board->halfmove_clock = 0;
+    } else {
+        ++board->halfmove_clock;
+    }
+
+    if (side == BLACK) {
+        ++board->fullmove_number;
+    }
+
+    board->side ^= 1;
+    board_sync_occupancy(board);
+    board_sync_kings(board);
+
+    if (board_is_in_check(board, side)) {
+        board_unmake_move(board, undo);
+        return false;
+    }
+
+    return true;
+}

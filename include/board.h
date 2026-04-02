@@ -1,0 +1,68 @@
+#ifndef BOARD_H
+#define BOARD_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "bitboard.h"
+#include "move.h"
+
+enum {
+    WHITE = 0,
+    BLACK = 1,
+    BOTH = 2
+};
+
+enum {
+    WHITE_PAWN,
+    WHITE_KNIGHT,
+    WHITE_BISHOP,
+    WHITE_ROOK,
+    WHITE_QUEEN,
+    WHITE_KING,
+    BLACK_PAWN,
+    BLACK_KNIGHT,
+    BLACK_BISHOP,
+    BLACK_ROOK,
+    BLACK_QUEEN,
+    BLACK_KING,
+    PIECE_NB
+};
+
+enum {
+    CASTLE_WHITE_KING = 1 << 0,
+    CASTLE_WHITE_QUEEN = 1 << 1,
+    CASTLE_BLACK_KING = 1 << 2,
+    CASTLE_BLACK_QUEEN = 1 << 3
+};
+
+typedef struct Board {
+    U64 pieces[PIECE_NB];
+    U64 occupancy[3];
+    int side;
+    int castling_rights;
+    int ep_square;
+    int halfmove_clock;
+    int fullmove_number;
+    int king_square[2];
+} Board;
+
+typedef struct Undo {
+    Board snapshot;
+} Undo;
+
+void board_init(Board *board);
+void board_set_startpos(Board *board);
+bool board_set_fen(Board *board, const char *fen);
+void board_clear(Board *board);
+bool board_make_move(Board *board, Move move, Undo *undo);
+void board_unmake_move(Board *board, const Undo *undo);
+bool board_is_square_attacked(const Board *board, int square, int attacker_side);
+bool board_is_in_check(const Board *board, int side);
+int board_piece_at(const Board *board, int square);
+int board_piece_color(int piece);
+int board_piece_type(int piece);
+int board_parse_square(const char *text);
+void board_square_to_string(int square, char buffer[3]);
+
+#endif
