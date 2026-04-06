@@ -249,8 +249,26 @@ static int count_pieces(Board *board) {
     return count;
 }
 
+static bool is_endgame_position(const Board *board) {
+    if (board == NULL) {
+        return false;
+    }
+
+    int non_king_count = 0;
+    non_king_count += popcount_u64(board->pieces[WHITE_KNIGHT]);
+    non_king_count += popcount_u64(board->pieces[WHITE_BISHOP]);
+    non_king_count += popcount_u64(board->pieces[WHITE_ROOK]);
+    non_king_count += popcount_u64(board->pieces[WHITE_QUEEN]);
+    non_king_count += popcount_u64(board->pieces[BLACK_KNIGHT]);
+    non_king_count += popcount_u64(board->pieces[BLACK_BISHOP]);
+    non_king_count += popcount_u64(board->pieces[BLACK_ROOK]);
+    non_king_count += popcount_u64(board->pieces[BLACK_QUEEN]);
+
+    return non_king_count <= 4;
+}
+
 static int calculate_dynamic_depth(Board *board, const SearchLimits *limits) {
-    int depth = 3;  /* Base depth. */
+    int depth = 4;  /* Base depth. */
 
     /* +1 if in check. */
     if (board_is_in_check(board, board->side)) {
@@ -313,17 +331,7 @@ static float evaluate(Board *board) {
 
     int side_to_move = board->side;
 
-    int non_king_count = 0;
-    non_king_count += popcount_u64(board->pieces[WHITE_KNIGHT]);
-    non_king_count += popcount_u64(board->pieces[WHITE_BISHOP]);
-    non_king_count += popcount_u64(board->pieces[WHITE_ROOK]);
-    non_king_count += popcount_u64(board->pieces[WHITE_QUEEN]);
-    non_king_count += popcount_u64(board->pieces[BLACK_KNIGHT]);
-    non_king_count += popcount_u64(board->pieces[BLACK_BISHOP]);
-    non_king_count += popcount_u64(board->pieces[BLACK_ROOK]);
-    non_king_count += popcount_u64(board->pieces[BLACK_QUEEN]);
-
-    int endgame = (non_king_count <= 4) ? 1 : -1;
+    int endgame = is_endgame_position(board) ? 1 : -1;
 
     int white_pawns_per_file[8];
     int black_pawns_per_file[8];
@@ -413,7 +421,7 @@ static int compare_scored_moves(const void *a, const void *b) {
     return move_b->score - move_a->score;
 }
 
-/* Quiescence search: only explores captures and checks. */
+/* Quiescence search: only explores captures, checks, and promotions. */
 static float quiescence(Board *board, float alpha, float beta) {
     /* Stand-pat: evaluate current position. */
     float stand_pat = evaluate(board);
@@ -430,12 +438,12 @@ static float quiescence(Board *board, float alpha, float beta) {
     MoveList list;
     movegen_generate_legal(board, &list);
 
-    /* Build and sort list of captures and checks. */
+    /* Build and sort list of captures, checks, and promotions. */
     ScoredMove scored_moves[256];
     int scored_count = 0;
     for (int i = 0; i < list.count; ++i) {
         Move move = list.moves[i];
-        if (move_iscapture(board, move) || move_ischeck(board, move)) {
+        if (move_iscapture(board, move) || move_ischeck(board, move) || move_promotion(move) != MOVE_PROMO_NONE) {
             scored_moves[scored_count].move = move;
             scored_moves[scored_count].score = estimate_move_score(board, move);
             ++scored_count;
@@ -473,6 +481,33 @@ static float quiescence(Board *board, float alpha, float beta) {
 /* Alpha-beta pruned negamax search. */
 static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
     SearchResult result = {0.0f, MOVE_NONE};
+
+    /* Null-move pruning in non-endgames to avoid zugzwang issues. */
+    if (depth >= 3 &&
+        beta < 10000.0f &&
+        !board_is_in_check(board, board->side) &&
+        !is_endgame_position(board)) {
+        const int reduction = 2;
+        Undo undo;
+        undo.snapshot = *board;
+
+        if (board->side == BLACK) {
+            ++board->fullmove_number;
+        }
+        board->side ^= 1;
+        board->ep_square = -1;
+        ++board->halfmove_clock;
+
+        SearchResult null_child = negamax(board, depth - 1 - reduction, -beta, -beta + 1.0f);
+        float null_score = -null_child.score;
+
+        board_unmake_move(board, &undo);
+
+        if (null_score >= beta) {
+            result.score = beta;
+            return result;
+        }
+    }
 
     /* Leaf node: run quiescence search. */
     if (depth == 0) {
