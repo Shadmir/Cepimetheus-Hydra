@@ -77,8 +77,8 @@ void uci_loop(void) {
     char line[4096];
     while (fgets(line, sizeof(line), stdin) != NULL) {
         if (strncmp(line, "uci", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t' || line[3] == '\r' || line[3] == '\n')) {
-            printf("id name Chess2 Framework\n");
-            printf("id author GitHub Copilot\n");
+            printf("id name Cepimetheus\n");
+            printf("id author  George Bland\n");
             printf("uciok\n");
             fflush(stdout);
             continue;

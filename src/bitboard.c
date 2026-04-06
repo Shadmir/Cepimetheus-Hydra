@@ -1,5 +1,7 @@
 #include "bitboard.h"
 
+#include "board.h"
+
 static U64 knight_table[64];
 static U64 king_table[64];
 static U64 pawn_table[2][64];
