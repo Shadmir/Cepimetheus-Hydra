@@ -18,6 +18,10 @@ Start the engine binary and speak UCI over stdin/stdout:
 ./chess2
 ```
 
+The engine accepts `go depth N` and defaults to depth 3 when no depth is supplied or when `depth 0` is sent.
+
+It also emits UCI `info` lines while searching, including a centipawn evaluation for each root move.
+
 ## Current shape
 
 - Bitboard-based board state

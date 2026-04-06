@@ -1,4 +1,5 @@
 #include "think.h"
+#include <stdio.h>
 #include "float.h"
 #include <stdlib.h>
 #include <time.h>
@@ -12,6 +13,36 @@ typedef struct {
     Move move;
     int score;
 } ScoredMove;
+
+static int score_to_cp(float score) {
+    if (score >= 0.0f) {
+        return (int)(score + 0.5f);
+    }
+
+    return (int)(score - 0.5f);
+}
+
+static void print_move_info(int depth, int move_number, Move move, float score) {
+    char move_buffer[6];
+    move_to_string(move, move_buffer);
+    printf("info depth %d currmove %s currmovenumber %d score cp %d\n",
+           depth,
+           move_buffer,
+           move_number,
+           score_to_cp(score));
+    fflush(stdout);
+}
+
+static void print_depth_info(int depth, SearchResult result) {
+    printf("info depth %d score cp %d", depth, score_to_cp(result.score));
+    if (result.move != MOVE_NONE) {
+        char move_buffer[6];
+        move_to_string(result.move, move_buffer);
+        printf(" pv %s", move_buffer);
+    }
+    printf("\n");
+    fflush(stdout);
+}
 
 static const int piece_values[6] = {
     100, /* Pawn */
@@ -33,6 +64,55 @@ static int popcount_u64(U64 bb) {
     }
 
     return count;
+}
+
+static int count_pieces(Board *board) {
+    if (board == NULL) {
+        return 0;
+    }
+
+    int count = 0;
+    for (int piece = 0; piece < PIECE_NB; ++piece) {
+        count += popcount_u64(board->pieces[piece]);
+    }
+    return count;
+}
+
+static int calculate_dynamic_depth(Board *board, const SearchLimits *limits) {
+    int depth = 3;  /* Base depth. */
+
+    /* +1 if in check. */
+    if (board_is_in_check(board, board->side)) {
+        depth++;
+    }
+
+    /* Count pieces on the board. */
+    int piece_count = count_pieces(board);
+
+    /* +1 if less than 15 pieces. */
+    if (piece_count < 15) {
+        depth++;
+    }
+
+    /* +1 again if less than 10 pieces. */
+    if (piece_count < 10) {
+        depth++;
+    }
+
+    /* -1 if we have less than a minute on the clock. */
+    if (limits != NULL) {
+        int current_time = (board->side == WHITE) ? limits->wtime_ms : limits->btime_ms;
+        if (current_time > 0 && current_time < 60000) {
+            depth--;
+        }
+    }
+
+    /* Ensure depth is at least 1. */
+    if (depth < 1) {
+        depth = 1;
+    }
+
+    return depth;
 }
 
 static float evaluate(Board *board) {
@@ -245,14 +325,78 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
     return result;
 }
 
-Move think(Board *board, const SearchLimits *limits) {
-    (void)limits;
+static SearchResult search_root(Board *board, int depth) {
+    SearchResult result = {0.0f, MOVE_NONE};
+    float alpha = -FLT_MAX;
+    float beta = FLT_MAX;
 
+    MoveList list;
+    movegen_generate_legal(board, &list);
+
+    if (list.count == 0) {
+        result.score = quiescence(board, alpha, beta);
+        return result;
+    }
+
+    ScoredMove scored_moves[256];
+    for (int i = 0; i < list.count; ++i) {
+        scored_moves[i].move = list.moves[i];
+        scored_moves[i].score = estimate_move_score(board, list.moves[i]);
+    }
+    qsort(scored_moves, list.count, sizeof(ScoredMove), compare_scored_moves);
+
+    for (int i = 0; i < list.count; ++i) {
+        Move move = scored_moves[i].move;
+        Undo undo;
+
+        if (!board_make_move(board, move, &undo)) {
+            continue;
+        }
+
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha);
+        float score = -child.score;
+
+        board_unmake_move(board, &undo);
+
+        print_move_info(depth, i + 1, move, score);
+
+        if (score > result.score || result.move == MOVE_NONE) {
+            result.score = score;
+            result.move = move;
+        }
+
+        if (score > alpha) {
+            alpha = score;
+        }
+
+        if (alpha >= beta) {
+            break;
+        }
+    }
+
+    return result;
+}
+
+Move think(Board *board, const SearchLimits *limits) {
     if (board == NULL) {
         return MOVE_NONE;
     }
 
-    SearchResult result = negamax(board, 3, -FLT_MAX, FLT_MAX);
+    int depth = 0;
+    if (limits != NULL && limits->depth > 0) {
+        /* Explicit depth set via UCI. */
+        depth = limits->depth;
+    } else {
+        /* Depth not explicitly set, calculate dynamically. */
+        depth = calculate_dynamic_depth(board, limits);
+    }
+
+    SearchResult result = {0.0f, MOVE_NONE};
+    for (int current_depth = 1; current_depth <= depth; ++current_depth) {
+        result = search_root(board, current_depth);
+        print_depth_info(current_depth, result);
+    }
+
     if (result.move == MOVE_NONE) {
         return MOVE_NONE;
     }

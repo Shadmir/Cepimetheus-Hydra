@@ -54,9 +54,31 @@ static void apply_position(Board *board, char *line) {
 }
 
 static void handle_go(Board *board, char *line) {
-    (void)line;
     SearchLimits limits;
     memset(&limits, 0, sizeof(limits));
+
+    for (char *token = strtok(line, " \t\r\n"); token != NULL; token = strtok(NULL, " \t\r\n")) {
+        if (strcmp(token, "depth") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                int parsed_depth = atoi(value);
+                if (parsed_depth > 0) {
+                    limits.depth = parsed_depth;
+                }
+            }
+        } else if (strcmp(token, "wtime") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                limits.wtime_ms = atoi(value);
+            }
+        } else if (strcmp(token, "btime") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                limits.btime_ms = atoi(value);
+            }
+        }
+    }
+
     Move best = think(board, &limits);
     if (best == MOVE_NONE) {
         printf("bestmove 0000\n");
