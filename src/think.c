@@ -66,6 +66,177 @@ static int popcount_u64(U64 bb) {
     return count;
 }
 
+static int rank_of(int square) {
+    return square >> 3;
+}
+
+static int file_of(int square) {
+    return square & 7;
+}
+
+static void count_pawns_per_file(U64 pawns, int pawns_per_file[8]) {
+    for (int i = 0; i < 8; ++i) {
+        pawns_per_file[i] = 0;
+    }
+
+    U64 bb = pawns;
+    while (bb) {
+        int square = bitboard_pop_lsb(&bb);
+        if (square >= 0) {
+            pawns_per_file[file_of(square)]++;
+        }
+    }
+}
+
+static void mark_passed_pawns(const Board *board, int side, bool passed_pawns[64]) {
+    for (int i = 0; i < 64; ++i) {
+        passed_pawns[i] = false;
+    }
+
+    U64 own_pawns = board->pieces[side == WHITE ? WHITE_PAWN : BLACK_PAWN];
+    U64 enemy_pawns = board->pieces[side == WHITE ? BLACK_PAWN : WHITE_PAWN];
+
+    U64 bb = own_pawns;
+    while (bb) {
+        int square = bitboard_pop_lsb(&bb);
+        int file = file_of(square);
+        int rank = rank_of(square);
+        bool blocked_by_enemy_pawn = false;
+
+        for (int f = file - 1; f <= file + 1; ++f) {
+            if (f < 0 || f > 7) {
+                continue;
+            }
+
+            if (side == WHITE) {
+                for (int r = rank + 1; r < 8; ++r) {
+                    int target = r * 8 + f;
+                    if (enemy_pawns & bitboard_square(target)) {
+                        blocked_by_enemy_pawn = true;
+                        break;
+                    }
+                }
+            } else {
+                for (int r = rank - 1; r >= 0; --r) {
+                    int target = r * 8 + f;
+                    if (enemy_pawns & bitboard_square(target)) {
+                        blocked_by_enemy_pawn = true;
+                        break;
+                    }
+                }
+            }
+
+            if (blocked_by_enemy_pawn) {
+                break;
+            }
+        }
+
+        if (!blocked_by_enemy_pawn) {
+            passed_pawns[square] = true;
+        }
+    }
+}
+
+static float evaluate_piece(const Board *board,
+                            int piece,
+                            int square,
+                            int endgame,
+                            const bool passed_pawns[64],
+                            const int white_pawns_per_file[8],
+                            const int black_pawns_per_file[8]) {
+    int side = board_piece_color(piece);
+    int type = board_piece_type(piece);
+    int file = file_of(square);
+    int rank = rank_of(square);
+    bool is_white = (side == WHITE);
+    float piece_value = (float)piece_values[type];
+
+    if (type == WHITE_PAWN) {
+        int pawn_rank = is_white ? rank : (7 - rank);
+        if (endgame == 1) { //Reward advanced pawns in the endgame
+            piece_value += 2.0f * (float)pawn_rank;
+            if (passed_pawns[square]) {
+                piece_value += 4.0f * (float)pawn_rank;
+            }
+        }
+
+        const int *pawns_per_file = is_white ? white_pawns_per_file : black_pawns_per_file;
+        int this_file_count = pawns_per_file[file];
+
+        if (this_file_count > 1) {
+            //Doubled pawn penalty: -5 points for each same colour pawn on the file
+            piece_value -= 5.0f * (float)(this_file_count - 1);
+        }
+
+        bool has_left = (file > 0) && (pawns_per_file[file - 1] > 0);
+        bool has_right = (file < 7) && (pawns_per_file[file + 1] > 0);
+        if (!has_left && !has_right) {
+            //Isolated pawn penalty: -10 points if no same colour pawns on adjacent files
+            piece_value -= 10.0f;
+        }
+
+        return piece_value;
+    }
+
+    if (type == WHITE_KNIGHT) {
+        //Knights on the rim are grim
+        return piece_value + 3.0f * (float)popcount_u64(bitboard_knight_attacks(square));
+    }
+
+    if (type == WHITE_BISHOP) {
+        //Slider attacks take into account blocked pieces, so this rewards bishops with more mobility
+        return piece_value + 2.0f * (float)popcount_u64(bitboard_bishop_attacks(square, board->occupancy[BOTH]));
+    }
+
+    if (type == WHITE_ROOK) {
+        if (endgame == -1) {//None endgame evaluation
+            //Reward for squares controlled
+            piece_value += 1.0f * (float)popcount_u64(bitboard_rook_attacks(square, board->occupancy[BOTH]));
+
+            U64 all_pawns = board->pieces[WHITE_PAWN] | board->pieces[BLACK_PAWN];
+            U64 file_mask = 0x0101010101010101ULL << file;
+            //Open file bonus: +50 points if no pawns on the file
+            if (popcount_u64(all_pawns & file_mask) == 0) {
+                piece_value += 50.0f;
+            }
+        } else {
+            //Rooks are better in the endgame
+            piece_value += 100.0f;
+        }
+
+        return piece_value;
+    }
+
+    if (type == WHITE_QUEEN) {
+        return piece_value + 0.5f * (float)popcount_u64(bitboard_queen_attacks(square, board->occupancy[BOTH]));
+    }
+    // If nothing prior it is a king
+    if (endgame == -1) {
+        //In the opening/midgame, king safety is important. Penalise kings with more possible attacks against them.
+        piece_value -= (float)popcount_u64(bitboard_queen_attacks(square, board->occupancy[BOTH]));
+    }
+    //Calculate Manhattan distance to closest corner
+    int distance_a1 = file + rank;
+    int distance_h1 = (7 - file) + rank;
+    int distance_a8 = file + (7 - rank);
+    int distance_h8 = (7 - file) + (7 - rank);
+    int corner_distance = distance_a1;
+    if (distance_h1 < corner_distance) {
+        corner_distance = distance_h1;
+    }
+    if (distance_a8 < corner_distance) {
+        corner_distance = distance_a8;
+    }
+    if (distance_h8 < corner_distance) {
+        corner_distance = distance_h8;
+    }
+
+    //If endgame then favour activity over safety
+    //Penalty in the opening/middlegame becomes reward in the endgame
+    piece_value += (float)(endgame * corner_distance * 3);
+    return piece_value;
+}
+
 static int count_pieces(Board *board) {
     if (board == NULL) {
         return 0;
@@ -140,26 +311,63 @@ static float evaluate(Board *board) {
         return 0.0f;
     }
 
-    /* Material evaluation. */
-    float score = 0.0f;
     int side_to_move = board->side;
 
-    for (int piece = 0; piece < PIECE_NB; ++piece) {
-        int value = piece_values[piece % 6];
-        int count = popcount_u64(board->pieces[piece]);
-        int piece_side = (piece < BLACK_PAWN) ? WHITE : BLACK;
+    int non_king_count = 0;
+    non_king_count += popcount_u64(board->pieces[WHITE_KNIGHT]);
+    non_king_count += popcount_u64(board->pieces[WHITE_BISHOP]);
+    non_king_count += popcount_u64(board->pieces[WHITE_ROOK]);
+    non_king_count += popcount_u64(board->pieces[WHITE_QUEEN]);
+    non_king_count += popcount_u64(board->pieces[BLACK_KNIGHT]);
+    non_king_count += popcount_u64(board->pieces[BLACK_BISHOP]);
+    non_king_count += popcount_u64(board->pieces[BLACK_ROOK]);
+    non_king_count += popcount_u64(board->pieces[BLACK_QUEEN]);
 
-        if (piece_side == side_to_move) {
-            score += (float)(value * count);
-        } else {
-            score -= (float)(value * count);
+    int endgame = (non_king_count <= 4) ? 1 : -1;
+
+    int white_pawns_per_file[8];
+    int black_pawns_per_file[8];
+    count_pawns_per_file(board->pieces[WHITE_PAWN], white_pawns_per_file);
+    count_pawns_per_file(board->pieces[BLACK_PAWN], black_pawns_per_file);
+
+    bool white_passed_pawns[64];
+    bool black_passed_pawns[64];
+    mark_passed_pawns(board, WHITE, white_passed_pawns);
+    mark_passed_pawns(board, BLACK, black_passed_pawns);
+
+    float white_score = 0.0f;
+    float black_score = 0.0f;
+
+    for (int piece = 0; piece < PIECE_NB; ++piece) {
+        U64 bb = board->pieces[piece];
+        while (bb) {
+            int square = bitboard_pop_lsb(&bb);
+            int side = board_piece_color(piece);
+            const bool *passed = (side == WHITE) ? white_passed_pawns : black_passed_pawns;
+            float value = evaluate_piece(board,
+                                         piece,
+                                         square,
+                                         endgame,
+                                         passed,
+                                         white_pawns_per_file,
+                                         black_pawns_per_file);
+
+            if (side == WHITE) {
+                white_score += value;
+            } else {
+                black_score += value;
+            }
         }
     }
 
-    return score;
+    if (side_to_move == WHITE) {
+        return white_score - black_score;
+    }
+
+    return black_score - white_score;
 }
 
-/* Estimate move score for move ordering. */
+/* Estimate move score for move ordering. This is intentionally cheap. */
 static int estimate_move_score(Board *board, Move move) {
     int score = 0;
 
