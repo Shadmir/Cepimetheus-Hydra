@@ -421,7 +421,7 @@ static int compare_scored_moves(const void *a, const void *b) {
     return move_b->score - move_a->score;
 }
 
-/* Quiescence search: only explores captures, checks, and promotions. */
+/* Quiescence search: only explores captures and checks. */
 static float quiescence(Board *board, float alpha, float beta) {
     /* Stand-pat: evaluate current position. */
     float stand_pat = evaluate(board);
@@ -438,12 +438,12 @@ static float quiescence(Board *board, float alpha, float beta) {
     MoveList list;
     movegen_generate_legal(board, &list);
 
-    /* Build and sort list of captures, checks, and promotions. */
+    /* Build and sort list of captures and checks. */
     ScoredMove scored_moves[256];
     int scored_count = 0;
     for (int i = 0; i < list.count; ++i) {
         Move move = list.moves[i];
-        if (move_iscapture(board, move) || move_ischeck(board, move) || move_promotion(move) != MOVE_PROMO_NONE) {
+        if (move_iscapture(board, move) || move_ischeck(board, move)) {
             scored_moves[scored_count].move = move;
             scored_moves[scored_count].score = estimate_move_score(board, move);
             ++scored_count;
@@ -482,7 +482,7 @@ static float quiescence(Board *board, float alpha, float beta) {
 static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
     SearchResult result = {0.0f, MOVE_NONE};
 
-    /* Null-move pruning in non-endgames to avoid zugzwang issues. */
+    /* Null-move pruning, avoided in endgames to avoid zugzwang issues. */
     if (depth >= 3 &&
         beta < 10000.0f &&
         !board_is_in_check(board, board->side) &&
@@ -635,10 +635,8 @@ Move think(Board *board, const SearchLimits *limits) {
     }
 
     SearchResult result = {0.0f, MOVE_NONE};
-    for (int current_depth = 1; current_depth <= depth; ++current_depth) {
-        result = search_root(board, current_depth);
-        print_depth_info(current_depth, result);
-    }
+    result = search_root(board, depth);
+    print_depth_info(depth, result);
 
     if (result.move == MOVE_NONE) {
         return MOVE_NONE;
