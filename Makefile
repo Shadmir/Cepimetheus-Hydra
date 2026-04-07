@@ -3,7 +3,7 @@ CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Wpedantic -Iinclude
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN32_CC ?= i686-w64-mingw32-gcc
 
-TARGET := chess2
+TARGET := Cepimetheus
 SRC := \
 	src/main.c \
 	src/uci.c \
@@ -27,11 +27,11 @@ run: $(TARGET)
 
 windows:
 	$(MAKE) clean
-	$(MAKE) CC=$(WIN_CC) TARGET=chess2.exe
+	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus.exe
 
 windows32:
 	$(MAKE) clean
-	$(MAKE) CC=$(WIN32_CC) TARGET=chess2.exe
+	$(MAKE) CC=$(WIN32_CC) TARGET=Cepimetheus.exe
 
 clean:
-	rm -f $(OBJ) $(TARGET) chess2.exe
+	rm -f $(OBJ) $(TARGET) Cepimetheus.exe
