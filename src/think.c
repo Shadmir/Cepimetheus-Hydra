@@ -156,6 +156,7 @@ static float evaluate_piece(const Board *board,
         if (endgame == 1) { //Reward advanced pawns in the endgame
             piece_value += 2.0f * (float)pawn_rank;
             if (passed_pawns[square]) {
+                //Passed pawns are further rewarded for advancement
                 piece_value += 4.0f * (float)pawn_rank;
             }
         }
@@ -367,12 +368,14 @@ static float evaluate(Board *board) {
             }
         }
     }
+    //Unless the position is zugzwang, having a move will make the position better
+    float tempo_bonus = (endgame == -1) ? 10.0f : 0.0f;
 
     if (side_to_move == WHITE) {
-        return white_score - black_score;
+        return white_score - black_score + tempo_bonus;
     }
 
-    return black_score - white_score;
+    return black_score - white_score + tempo_bonus;
 }
 
 /* Estimate move score for move ordering. This is intentionally cheap. */
