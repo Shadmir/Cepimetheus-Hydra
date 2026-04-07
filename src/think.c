@@ -318,7 +318,7 @@ static float evaluate(Board *board) {
         /* No legal moves: checkmate or stalemate. */
         if (board_is_in_check(board, board->side)) {
             /* Checkmate: very bad for side to move. */
-            return -10000.0f;
+            return -100000.0f;
         } else {
             /* Stalemate: draw. */
             return 0.0f;
