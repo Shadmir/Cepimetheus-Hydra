@@ -14,6 +14,30 @@ typedef struct {
     int score;
 } ScoredMove;
 
+/* File masks - one per file (A-H) */
+static const U64 file_masks[8] = {
+    0x0101010101010101ULL, /* A-file */
+    0x0202020202020202ULL, /* B-file */
+    0x0404040404040404ULL, /* C-file */
+    0x0808080808080808ULL, /* D-file */
+    0x1010101010101010ULL, /* E-file */
+    0x2020202020202020ULL, /* F-file */
+    0x4040404040404040ULL, /* G-file */
+    0x8080808080808080ULL   /* H-file */
+};
+
+/* Rank masks - one per rank (1-8) */
+static const U64 rank_masks[8] = {
+    0x00000000000000FFULL, /* Rank 1 */
+    0x000000000000FF00ULL, /* Rank 2 */
+    0x0000000000FF0000ULL, /* Rank 3 */
+    0x00000000FF000000ULL, /* Rank 4 */
+    0x000000FF00000000ULL, /* Rank 5 */
+    0x0000FF0000000000ULL, /* Rank 6 */
+    0x00FF000000000000ULL, /* Rank 7 */
+    0xFF00000000000000ULL   /* Rank 8 */
+};
+
 static int score_to_cp(float score) {
     if (score >= 0.0f) {
         return (int)(score + 0.5f);
@@ -79,13 +103,21 @@ static void count_pawns_per_file(U64 pawns, int pawns_per_file[8]) {
         pawns_per_file[i] = 0;
     }
 
-    U64 bb = pawns;
-    while (bb) {
-        int square = bitboard_pop_lsb(&bb);
-        if (square >= 0) {
-            pawns_per_file[file_of(square)]++;
-        }
+    for (int f = 0; f < 8; ++f) {
+    pawns_per_file[f] = popcount_u64(pawns & file_masks[f]);
     }
+}
+
+/* Get mask for all ranks ahead of given rank (for white pawns: rank+1 to 7) */
+static U64 get_ranks_ahead_white(int rank) {
+    if (rank >= 7) return 0;
+    return 0xFFFFFFFFFFFFFFFFULL << ((rank + 1) * 8);
+}
+
+/* Get mask for all ranks ahead of given rank (for black pawns: 0 to rank-1) */
+static U64 get_ranks_ahead_black(int rank) {
+    if (rank <= 0) return 0;
+    return (1ULL << (rank * 8)) - 1;
 }
 
 static void mark_passed_pawns(const Board *board, int side, bool passed_pawns[64]) {
@@ -101,37 +133,18 @@ static void mark_passed_pawns(const Board *board, int side, bool passed_pawns[64
         int square = bitboard_pop_lsb(&bb);
         int file = file_of(square);
         int rank = rank_of(square);
-        bool blocked_by_enemy_pawn = false;
-
-        for (int f = file - 1; f <= file + 1; ++f) {
-            if (f < 0 || f > 7) {
-                continue;
-            }
-
-            if (side == WHITE) {
-                for (int r = rank + 1; r < 8; ++r) {
-                    int target = r * 8 + f;
-                    if (enemy_pawns & bitboard_square(target)) {
-                        blocked_by_enemy_pawn = true;
-                        break;
-                    }
-                }
-            } else {
-                for (int r = rank - 1; r >= 0; --r) {
-                    int target = r * 8 + f;
-                    if (enemy_pawns & bitboard_square(target)) {
-                        blocked_by_enemy_pawn = true;
-                        break;
-                    }
-                }
-            }
-
-            if (blocked_by_enemy_pawn) {
-                break;
-            }
-        }
-
-        if (!blocked_by_enemy_pawn) {
+        
+        /* Create mask for current file and adjacent files */
+        U64 check_files = 0;
+        if (file > 0) check_files |= file_masks[file - 1];
+        check_files |= file_masks[file];
+        if (file < 7) check_files |= file_masks[file + 1];
+        
+        /* Get mask for ranks ahead of this pawn */
+        U64 ranks_ahead = (side == WHITE) ? get_ranks_ahead_white(rank) : get_ranks_ahead_black(rank);
+        
+        /* Check if any enemy pawns exist in the check region */
+        if ((enemy_pawns & check_files & ranks_ahead) == 0) {
             passed_pawns[square] = true;
         }
     }
@@ -195,7 +208,7 @@ static float evaluate_piece(const Board *board,
             piece_value += 1.0f * (float)popcount_u64(bitboard_rook_attacks(square, board->occupancy[BOTH]));
 
             U64 all_pawns = board->pieces[WHITE_PAWN] | board->pieces[BLACK_PAWN];
-            U64 file_mask = 0x0101010101010101ULL << file;
+            U64 file_mask = file_masks[file];
             //Open file bonus: +50 points if no pawns on the file
             if (popcount_u64(all_pawns & file_mask) == 0) {
                 piece_value += 50.0f;
@@ -456,7 +469,7 @@ static float quiescence(Board *board, float alpha, float beta) {
     /* Sort moves by estimated score. */
     qsort(scored_moves, scored_count, sizeof(ScoredMove), compare_scored_moves);
 
-    /* Search only captures and checks. */
+    /* Search moves. */
     for (int i = 0; i < scored_count; ++i) {
         Move move = scored_moves[i].move;
         Undo undo;
