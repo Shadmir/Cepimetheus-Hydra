@@ -29,9 +29,6 @@ windows:
 	$(MAKE) clean
 	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus.exe
 
-windows32:
-	$(MAKE) clean
-	$(MAKE) CC=$(WIN32_CC) TARGET=Cepimetheus.exe
 
 clean:
 	rm -f $(OBJ) $(TARGET) Cepimetheus.exe

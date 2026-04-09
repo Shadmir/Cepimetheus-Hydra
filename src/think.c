@@ -413,10 +413,12 @@ static int estimate_move_score(Board *board, Move move) {
         score += 9000 + (move_promotion(move) * 100);
     }
 
-    /* Castling. */
+    /* Castling. I saw online that this is too much computation to include in move ordering
+    Keep the code in case we change our mind
     if ((move_flags(move) & MOVE_FLAG_CASTLE) != 0) {
         score += 1000;
     }
+    */
 
     /* Check if move gives check. */
     Undo undo;
