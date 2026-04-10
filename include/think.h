@@ -14,6 +14,6 @@ typedef struct SearchLimits {
     bool infinite;
 } SearchLimits;
 
-Move think(Board *board, const SearchLimits *limits);
+Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *history);
 
 #endif

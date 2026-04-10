@@ -4,7 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void apply_uci_move(Board *board, const char *move_text) {
+static void push_current_position(Board *board, RepetitionHistory *history) {
+    if (history == NULL) {
+        return;
+    }
+
+    repetition_history_init(history);
+    repetition_history_push(history, board_position_key(board));
+}
+
+static void apply_uci_move(Board *board, RepetitionHistory *history, const char *move_text) {
     Move move;
     if (!movegen_find_legal_move(board, move_text, &move)) {
         return;
@@ -13,9 +22,13 @@ static void apply_uci_move(Board *board, const char *move_text) {
     if (!board_make_move(board, move, &undo)) {
         return;
     }
+
+    if (history != NULL) {
+        repetition_history_push(history, board_position_key(board));
+    }
 }
 
-static void apply_position(Board *board, char *line) {
+static void apply_position(Board *board, RepetitionHistory *history, char *line) {
     char *tokens[256];
     int token_count = 0;
     for (char *token = strtok(line, " \t\r\n"); token != NULL && token_count < 256; token = strtok(NULL, " \t\r\n")) {
@@ -29,6 +42,7 @@ static void apply_position(Board *board, char *line) {
     int move_start = 0;
     if (strcmp(tokens[1], "startpos") == 0) {
         board_set_startpos(board);
+        push_current_position(board, history);
         move_start = 2;
     } else if (strcmp(tokens[1], "fen") == 0) {
         if (token_count < 8) {
@@ -39,6 +53,7 @@ static void apply_position(Board *board, char *line) {
         if (!board_set_fen(board, fen)) {
             board_set_startpos(board);
         }
+        push_current_position(board, history);
         move_start = 8;
     } else {
         return;
@@ -49,11 +64,11 @@ static void apply_position(Board *board, char *line) {
     }
 
     for (int i = move_start; i < token_count; ++i) {
-        apply_uci_move(board, tokens[i]);
+        apply_uci_move(board, history, tokens[i]);
     }
 }
 
-static void handle_go(Board *board, char *line) {
+static void handle_go(Board *board, RepetitionHistory *history, char *line) {
     SearchLimits limits;
     memset(&limits, 0, sizeof(limits));
 
@@ -79,7 +94,7 @@ static void handle_go(Board *board, char *line) {
         }
     }
 
-    Move best = think(board, &limits);
+    Move best = think(board, &limits, history);
     if (best == MOVE_NONE) {
         printf("bestmove 0000\n");
         fflush(stdout);
@@ -95,6 +110,8 @@ static void handle_go(Board *board, char *line) {
 void uci_loop(void) {
     Board board;
     board_init(&board);
+    RepetitionHistory history;
+    push_current_position(&board, &history);
 
     char line[4096];
     while (fgets(line, sizeof(line), stdin) != NULL) {
@@ -114,16 +131,17 @@ void uci_loop(void) {
 
         if (strncmp(line, "ucinewgame", 10) == 0) {
             board_set_startpos(&board);
+            push_current_position(&board, &history);
             continue;
         }
 
         if (strncmp(line, "position", 8) == 0) {
-            apply_position(&board, line);
+            apply_position(&board, &history, line);
             continue;
         }
 
         if (strncmp(line, "go", 2) == 0 && (line[2] == '\0' || line[2] == ' ' || line[2] == '\t' || line[2] == '\r' || line[2] == '\n')) {
-            handle_go(&board, line);
+            handle_go(&board, &history, line);
             continue;
         }
 

@@ -198,8 +198,9 @@ static float evaluate_piece(const Board *board,
     }
 
     if (type == WHITE_BISHOP) {
-        //Slider attacks take into account blocked pieces, so this rewards bishops with more mobility
-        return piece_value + 2.0f * (float)popcount_u64(bitboard_bishop_attacks(square, board->occupancy[BOTH]));
+        //Slider attacks not blocked by pawns, so this rewards bishops with more mobility
+        U64 pawn_occupancy = board->pieces[WHITE_PAWN] | board->pieces[BLACK_PAWN];
+        return piece_value + 1.5f * (float)popcount_u64(bitboard_bishop_attacks(square, pawn_occupancy));
     }
 
     if (type == WHITE_ROOK) {
@@ -318,12 +319,15 @@ static int calculate_dynamic_depth(Board *board, const SearchLimits *limits) {
     return depth;
 }
 
-static float evaluate(Board *board) {
+static float evaluate(Board *board, const RepetitionHistory *history) {
     if (board == NULL) {
         return 0.0f;
     }
 
-    /* Check terminal conditions first. */
+    if (board_is_draw(board, history)) {
+        return 0.0f;
+    }
+
     MoveList list;
     movegen_generate_legal(board, &list);
 
@@ -336,11 +340,6 @@ static float evaluate(Board *board) {
             /* Stalemate: draw. */
             return 0.0f;
         }
-    }
-
-    /* 50-move rule: draw. */
-    if (board->halfmove_clock >= 100) {
-        return 0.0f;
     }
 
     int side_to_move = board->side;
@@ -440,9 +439,13 @@ static int compare_scored_moves(const void *a, const void *b) {
 }
 
 /* Quiescence search: only explores captures and checks. */
-static float quiescence(Board *board, float alpha, float beta) {
+static float quiescence(Board *board, float alpha, float beta, RepetitionHistory *history) {
+    if (board_is_draw(board, history)) {
+        return 0.0f;
+    }
+
     /* Stand-pat: evaluate current position. */
-    float stand_pat = evaluate(board);
+    float stand_pat = evaluate(board, history);
 
     if (stand_pat >= beta) {
         return beta;
@@ -480,7 +483,15 @@ static float quiescence(Board *board, float alpha, float beta) {
             continue;
         }
 
-        float score = -quiescence(board, -beta, -alpha);
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        float score = -quiescence(board, -beta, -alpha, history);
+
+        --history->count;
 
         board_unmake_move(board, &undo);
 
@@ -497,8 +508,13 @@ static float quiescence(Board *board, float alpha, float beta) {
 }
 
 /* Alpha-beta pruned negamax search. */
-static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
+static SearchResult negamax(Board *board, int depth, float alpha, float beta, RepetitionHistory *history) {
     SearchResult result = {0.0f, MOVE_NONE};
+
+    if (board_is_draw(board, history)) {
+        result.score = 0.0f;
+        return result;
+    }
 
     /* Null-move pruning, avoided in endgames to avoid zugzwang issues. */
     if (depth >= 3 &&
@@ -516,7 +532,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
         board->ep_square = -1;
         ++board->halfmove_clock;
 
-        SearchResult null_child = negamax(board, depth - 1 - reduction, -beta, -beta + 1.0f);
+        SearchResult null_child = negamax(board, depth - 1 - reduction, -beta, -beta + 1.0f, history);
         float null_score = -null_child.score;
 
         board_unmake_move(board, &undo);
@@ -529,7 +545,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
 
     /* Leaf node: run quiescence search. */
     if (depth == 0) {
-        result.score = quiescence(board, alpha, beta);
+        result.score = quiescence(board, alpha, beta, history);
         return result;
     }
 
@@ -539,7 +555,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
 
     /* No moves: run quiescence search on terminal position. */
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta);
+        result.score = quiescence(board, alpha, beta, history);
         return result;
     }
 
@@ -561,8 +577,16 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
         }
 
         /* Recurse with negated alpha and beta. */
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha);
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history);
         float score = -child.score;
+
+        --history->count;
 
         board_unmake_move(board, &undo);
 
@@ -586,7 +610,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta) {
     return result;
 }
 
-static SearchResult search_root(Board *board, int depth) {
+static SearchResult search_root(Board *board, int depth, RepetitionHistory *history) {
     SearchResult result = {0.0f, MOVE_NONE};
     float alpha = -FLT_MAX;
     float beta = FLT_MAX;
@@ -594,8 +618,16 @@ static SearchResult search_root(Board *board, int depth) {
     MoveList list;
     movegen_generate_legal(board, &list);
 
+    if (board_is_draw(board, history)) {
+        result.score = 0.0f;
+        if (list.count > 0) {
+            result.move = list.moves[0];
+        }
+        return result;
+    }
+
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta);
+        result.score = quiescence(board, alpha, beta, history);
         return result;
     }
 
@@ -614,8 +646,16 @@ static SearchResult search_root(Board *board, int depth) {
             continue;
         }
 
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha);
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history);
         float score = -child.score;
+
+        --history->count;
 
         board_unmake_move(board, &undo);
 
@@ -638,7 +678,7 @@ static SearchResult search_root(Board *board, int depth) {
     return result;
 }
 
-Move think(Board *board, const SearchLimits *limits) {
+Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *history) {
     if (board == NULL) {
         return MOVE_NONE;
     }
@@ -652,8 +692,14 @@ Move think(Board *board, const SearchLimits *limits) {
         depth = calculate_dynamic_depth(board, limits);
     }
 
+    RepetitionHistory search_history;
+    repetition_history_init(&search_history);
+    if (history != NULL) {
+        search_history = *history;
+    }
+
     SearchResult result = {0.0f, MOVE_NONE};
-    result = search_root(board, depth);
+    result = search_root(board, depth, &search_history);
     print_depth_info(depth, result);
 
     if (result.move == MOVE_NONE) {

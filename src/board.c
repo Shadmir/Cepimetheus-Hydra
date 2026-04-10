@@ -1,4 +1,5 @@
 #include "board.h"
+#include "movegen.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -72,6 +73,114 @@ static void board_sync_kings(Board *board) {
     U64 black_king = board->pieces[BLACK_KING];
     board->king_square[WHITE] = white_king ? bitboard_pop_lsb(&white_king) : -1;
     board->king_square[BLACK] = black_king ? bitboard_pop_lsb(&black_king) : -1;
+}
+
+static U64 mix_u64(U64 value) {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+}
+
+static U64 hash_combine(U64 hash, U64 value) {
+    hash ^= mix_u64(value + 0x9e3779b97f4a7c15ULL);
+    hash *= 1099511628211ULL;
+    return hash;
+}
+
+void repetition_history_init(RepetitionHistory *history) {
+    if (history != NULL) {
+        history->count = 0;
+    }
+}
+
+bool repetition_history_push(RepetitionHistory *history, U64 key) {
+    if (history == NULL || history->count >= REPETITION_HISTORY_MAX) {
+        return false;
+    }
+
+    history->keys[history->count++] = key;
+    return true;
+}
+
+static bool board_has_en_passant_capture(const Board *board) {
+    if (board == NULL || board->ep_square < 0 || board->ep_square >= 64) {
+        return false;
+    }
+
+    int ep_square = board->ep_square;
+    int file = file_of(ep_square);
+    int rank = rank_of(ep_square);
+
+    if (board->side == WHITE) {
+        if (file > 0 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (ep_square - 9)))) {
+            return true;
+        }
+        if (file < 7 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (ep_square - 7)))) {
+            return true;
+        }
+    } else {
+        if (file > 0 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (ep_square + 7)))) {
+            return true;
+        }
+        if (file < 7 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (ep_square + 9)))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+U64 board_position_key(const Board *board) {
+    if (board == NULL) {
+        return 0ULL;
+    }
+
+    U64 key = 1469598103934665603ULL;
+
+    for (int piece = 0; piece < PIECE_NB; ++piece) {
+        key = hash_combine(key, board->pieces[piece] ^ ((U64)piece << 56));
+    }
+
+    key = hash_combine(key, (U64)board->side);
+    key = hash_combine(key, (U64)board->castling_rights);
+    key = hash_combine(key, board_has_en_passant_capture(board) ? (U64)(board->ep_square + 1) : 0ULL);
+
+    return key;
+}
+
+bool board_is_draw(const Board *board, const RepetitionHistory *history) {
+    if (board == NULL) {
+        return false;
+    }
+
+    if (board->halfmove_clock >= 100) {
+        return true;
+    }
+
+    U64 current_key = board_position_key(board);
+    if (history != NULL && history->count > 1) {
+        int start = 0;
+        int history_limit = history->count - 1;
+        int halfmove_limit = history->count - 1 - board->halfmove_clock;
+
+        if (halfmove_limit > start) {
+            start = halfmove_limit;
+        }
+
+        for (int i = start; i < history_limit; ++i) {
+            if (history->keys[i] == current_key) {
+                return true;
+            }
+        }
+    }
+
+    MoveList list;
+    movegen_generate_legal((Board *)board, &list);
+
+    return list.count == 0 && !board_is_in_check(board, board->side);
 }
 
 void board_clear(Board *board) {

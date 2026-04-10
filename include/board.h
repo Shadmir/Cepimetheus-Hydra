@@ -36,6 +36,10 @@ enum {
     CASTLE_BLACK_QUEEN = 1 << 3
 };
 
+enum {
+    REPETITION_HISTORY_MAX = 1024
+};
+
 typedef struct Board {
     U64 pieces[PIECE_NB];
     U64 occupancy[3];
@@ -51,10 +55,19 @@ typedef struct Undo {
     Board snapshot;
 } Undo;
 
+typedef struct RepetitionHistory {
+    U64 keys[REPETITION_HISTORY_MAX];
+    int count;
+} RepetitionHistory;
+
 void board_init(Board *board);
 void board_set_startpos(Board *board);
 bool board_set_fen(Board *board, const char *fen);
 void board_clear(Board *board);
+void repetition_history_init(RepetitionHistory *history);
+bool repetition_history_push(RepetitionHistory *history, U64 key);
+U64 board_position_key(const Board *board);
+bool board_is_draw(const Board *board, const RepetitionHistory *history);
 bool board_make_move(Board *board, Move move, Undo *undo);
 void board_unmake_move(Board *board, const Undo *undo);
 bool board_is_square_attacked(const Board *board, int square, int attacker_side);
