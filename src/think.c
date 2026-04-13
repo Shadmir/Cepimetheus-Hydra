@@ -4,15 +4,24 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define MAX_PV_MOVES 128
+
 typedef struct {
     float score;
     Move move;
+    Move pv[MAX_PV_MOVES];
+    int pv_length;
 } SearchResult;
 
 typedef struct {
     Move move;
     int score;
 } ScoredMove;
+
+typedef struct {
+    unsigned long long nodes;
+    int seldepth;
+} SearchStats;
 
 /* File masks - one per file (A-H) */
 static const U64 file_masks[8] = {
@@ -57,13 +66,42 @@ static void print_move_info(int depth, int move_number, Move move, float score) 
     fflush(stdout);
 }
 
-static void print_depth_info(int depth, SearchResult result) {
-    printf("info depth %d score cp %d", depth, score_to_cp(result.score));
-    if (result.move != MOVE_NONE) {
-        char move_buffer[6];
-        move_to_string(result.move, move_buffer);
-        printf(" pv %s", move_buffer);
+static long long current_time_ms(void) {
+    clock_t now = clock();
+    if (now < 0) {
+        return 0;
     }
+
+    return (long long)((double)now * 1000.0 / (double)CLOCKS_PER_SEC);
+}
+
+static unsigned long long compute_nps(unsigned long long nodes, long long elapsed_ms) {
+    if (elapsed_ms <= 0) {
+        return nodes * 1000ULL;
+    }
+
+    return (nodes * 1000ULL) / (unsigned long long)elapsed_ms;
+}
+
+static void print_depth_info(int depth, const SearchResult *result, const SearchStats *stats, long long elapsed_ms) {
+    unsigned long long nps = compute_nps(stats->nodes, elapsed_ms);
+    printf("info depth %d seldepth %d score cp %d nodes %llu nps %llu time %lld",
+           depth,
+           stats->seldepth,
+           score_to_cp(result->score),
+           stats->nodes,
+           nps,
+           elapsed_ms);
+
+    if (result->pv_length > 0) {
+        printf(" pv");
+        for (int i = 0; i < result->pv_length; ++i) {
+            char move_buffer[6];
+            move_to_string(result->pv[i], move_buffer);
+            printf(" %s", move_buffer);
+        }
+    }
+
     printf("\n");
     fflush(stdout);
 }
@@ -439,7 +477,17 @@ static int compare_scored_moves(const void *a, const void *b) {
 }
 
 /* Quiescence search: only explores captures and checks. */
-static float quiescence(Board *board, float alpha, float beta, RepetitionHistory *history) {
+static float quiescence(Board *board,
+                        float alpha,
+                        float beta,
+                        RepetitionHistory *history,
+                        SearchStats *stats,
+                        int ply) {
+    ++stats->nodes;
+    if (ply > stats->seldepth) {
+        stats->seldepth = ply;
+    }
+
     if (board_is_draw(board, history)) {
         return 0.0f;
     }
@@ -489,7 +537,7 @@ static float quiescence(Board *board, float alpha, float beta, RepetitionHistory
             continue;
         }
 
-        float score = -quiescence(board, -beta, -alpha, history);
+        float score = -quiescence(board, -beta, -alpha, history, stats, ply + 1);
 
         --history->count;
 
@@ -508,8 +556,16 @@ static float quiescence(Board *board, float alpha, float beta, RepetitionHistory
 }
 
 /* Alpha-beta pruned negamax search. */
-static SearchResult negamax(Board *board, int depth, float alpha, float beta, RepetitionHistory *history) {
-    SearchResult result = {0.0f, MOVE_NONE};
+static SearchResult negamax(Board *board,
+                            int depth,
+                            float alpha,
+                            float beta,
+                            RepetitionHistory *history,
+                            SearchStats *stats,
+                            int ply) {
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+
+    ++stats->nodes;
 
     if (board_is_draw(board, history)) {
         result.score = 0.0f;
@@ -532,7 +588,13 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
         board->ep_square = -1;
         ++board->halfmove_clock;
 
-        SearchResult null_child = negamax(board, depth - 1 - reduction, -beta, -beta + 1.0f, history);
+        SearchResult null_child = negamax(board,
+                          depth - 1 - reduction,
+                          -beta,
+                          -beta + 1.0f,
+                          history,
+                          stats,
+                          ply + 1);
         float null_score = -null_child.score;
 
         board_unmake_move(board, &undo);
@@ -545,7 +607,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
 
     /* Leaf node: run quiescence search. */
     if (depth == 0) {
-        result.score = quiescence(board, alpha, beta, history);
+        result.score = quiescence(board, alpha, beta, history, stats, ply);
         return result;
     }
 
@@ -555,7 +617,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
 
     /* No moves: run quiescence search on terminal position. */
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta, history);
+        result.score = quiescence(board, alpha, beta, history, stats, ply);
         return result;
     }
 
@@ -583,7 +645,7 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
             continue;
         }
 
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history);
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, ply + 1);
         float score = -child.score;
 
         --history->count;
@@ -594,6 +656,11 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
         if (score > result.score || result.move == MOVE_NONE) {
             result.score = score;
             result.move = move;
+            result.pv[0] = move;
+            result.pv_length = 1;
+            for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
+                result.pv[result.pv_length++] = child.pv[j];
+            }
         }
 
         /* Update alpha. */
@@ -610,8 +677,8 @@ static SearchResult negamax(Board *board, int depth, float alpha, float beta, Re
     return result;
 }
 
-static SearchResult search_root(Board *board, int depth, RepetitionHistory *history) {
-    SearchResult result = {0.0f, MOVE_NONE};
+static SearchResult search_root(Board *board, int depth, RepetitionHistory *history, SearchStats *stats) {
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
     float alpha = -FLT_MAX;
     float beta = FLT_MAX;
 
@@ -622,12 +689,14 @@ static SearchResult search_root(Board *board, int depth, RepetitionHistory *hist
         result.score = 0.0f;
         if (list.count > 0) {
             result.move = list.moves[0];
+            result.pv[0] = list.moves[0];
+            result.pv_length = 1;
         }
         return result;
     }
 
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta, history);
+        result.score = quiescence(board, alpha, beta, history, stats, 0);
         return result;
     }
 
@@ -652,7 +721,7 @@ static SearchResult search_root(Board *board, int depth, RepetitionHistory *hist
             continue;
         }
 
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history);
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, 1);
         float score = -child.score;
 
         --history->count;
@@ -664,6 +733,11 @@ static SearchResult search_root(Board *board, int depth, RepetitionHistory *hist
         if (score > result.score || result.move == MOVE_NONE) {
             result.score = score;
             result.move = move;
+            result.pv[0] = move;
+            result.pv_length = 1;
+            for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
+                result.pv[result.pv_length++] = child.pv[j];
+            }
         }
 
         if (score > alpha) {
@@ -698,9 +772,18 @@ Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *hi
         search_history = *history;
     }
 
-    SearchResult result = {0.0f, MOVE_NONE};
-    result = search_root(board, depth, &search_history);
-    print_depth_info(depth, result);
+    SearchStats stats = {0ULL, depth};
+    long long start_time_ms = current_time_ms();
+
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+    result = search_root(board, depth, &search_history, &stats);
+
+    long long elapsed_ms = current_time_ms() - start_time_ms;
+    if (elapsed_ms < 0) {
+        elapsed_ms = 0;
+    }
+
+    print_depth_info(depth, &result, &stats, elapsed_ms);
 
     if (result.move == MOVE_NONE) {
         return MOVE_NONE;
