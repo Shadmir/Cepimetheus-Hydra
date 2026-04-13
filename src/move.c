@@ -1,7 +1,9 @@
 #include "move.h"
 
+#include <stdio.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "board.h"
 
@@ -30,6 +32,29 @@ void move_to_string(Move move, char buffer[6]) {
     } else {
         buffer[5] = '\0';
     }
+}
+
+void zobrist_hash_to_string(uint64_t hash, char buffer[17]) {
+    if (buffer == NULL) {
+        return;
+    }
+
+    snprintf(buffer, 17, "%016llx", (unsigned long long)hash);
+}
+
+bool zobrist_hash_from_string(const char *text, uint64_t *hash_out) {
+    if (text == NULL || hash_out == NULL || *text == '\0') {
+        return false;
+    }
+
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 16);
+    if (end == text || *end != '\0') {
+        return false;
+    }
+
+    *hash_out = (uint64_t)value;
+    return true;
 }
 
 bool move_iscapture(const struct Board *board, Move move) {
