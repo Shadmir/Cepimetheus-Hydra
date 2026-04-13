@@ -3,6 +3,7 @@
 #include "float.h"
 #include <stdlib.h>
 #include <time.h>
+#include <string.h>
 
 #define MAX_PV_MOVES 128
 
@@ -434,15 +435,14 @@ static int estimate_move_score(Board *board, Move move) {
 
     /* Captures - MVV/LVA (Most Valuable Victim / Least Valuable Aggressor). */
     if (move_iscapture(board, move)) {
-        int captured_piece = board_piece_at(board, move_to(move));
-        int moving_piece = board_piece_at(board, move_from(move));
+        int victim_piece = board_piece_at(board, move_to(move));
+        int attacker_piece = board_piece_at(board, move_from(move));
         
-        if (captured_piece >= 0 && moving_piece >= 0) {
-            int captured_value = piece_values[captured_piece % 6];
-            int moving_value = piece_values[moving_piece % 6];
-            int capture_value = captured_value - (moving_value / 100);
-            score += 10000 + capture_value;
-        }
+        int victim_value = piece_values[victim_piece];
+        int attacker_value = piece_values[attacker_piece];
+        
+        int capture_value = victim_value - attacker_value;
+        score += 1000 + capture_value;
     }
 
     /* Promotions. */
@@ -450,21 +450,20 @@ static int estimate_move_score(Board *board, Move move) {
         score += 9000 + (move_promotion(move) * 100);
     }
 
-    /* Castling. I saw online that this is too much computation to include in move ordering
-    Keep the code in case we change our mind
+    /* Castling. */
     if ((move_flags(move) & MOVE_FLAG_CASTLE) != 0) {
         score += 1000;
     }
-    */
 
-    /* Check if move gives check. */
+    /* Check if move gives check. I saw online that this is too much computation to be worth considering for move ordering
+    Keep the code in case we change our mind
     Undo undo;
     if (board_make_move(board, move, &undo)) {
         if (board_is_in_check(board, board->side)) {
             score += 500;
         }
         board_unmake_move(board, &undo);
-    }
+    } */
 
     return score;
 }
@@ -755,6 +754,39 @@ static SearchResult search_root(Board *board, int depth, RepetitionHistory *hist
 Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *history) {
     if (board == NULL) {
         return MOVE_NONE;
+    }
+
+    /* Play a random opening move for white's first move. */
+    if (board->fullmove_number == 1 && board->side == WHITE) {
+        MoveList list;
+        movegen_generate_legal(board, &list);
+
+        /* Target UCI notation moves: b3, b4, c4, d4, e4, f4, g3, Nc3, Nf3 */
+        const char *target_moves[] = {"b2b3", "b2b4", "c2c4", "d2d4", "e2e4", "f2f4", "g2g3", "b1c3", "g1f3"};
+        const int target_count = 9;
+
+        /* Find matching moves. */
+        Move matching_moves[256];
+        int match_count = 0;
+
+        char move_buffer[6];
+        for (int i = 0; i < list.count; ++i) {
+            move_to_string(list.moves[i], move_buffer);
+
+            for (int j = 0; j < target_count; ++j) {
+                if (strcmp(move_buffer, target_moves[j]) == 0) {
+                    matching_moves[match_count++] = list.moves[i];
+                    break;
+                }
+            }
+        }
+
+        /* Pick a random move if any were found. */
+        if (match_count > 0) {
+            srand((unsigned int)time(NULL));
+            int random_idx = rand() % match_count;
+            return matching_moves[random_idx];
+        }
     }
 
     int depth = 0;
