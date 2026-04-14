@@ -189,6 +189,47 @@ static int file_of(int square) {
     return square & 7;
 }
 
+static int count_attackers_on_square(const Board *board, int square, int attacker_side) {
+    int attackers = 0;
+
+    int file = file_of(square);
+    int rank = rank_of(square);
+
+    if (attacker_side == WHITE) {
+        if (file > 0 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (square - 9)))) {
+            ++attackers;
+        }
+        if (file < 7 && rank > 0 && (board->pieces[WHITE_PAWN] & (1ULL << (square - 7)))) {
+            ++attackers;
+        }
+    } else {
+        if (file > 0 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (square + 7)))) {
+            ++attackers;
+        }
+        if (file < 7 && rank < 7 && (board->pieces[BLACK_PAWN] & (1ULL << (square + 9)))) {
+            ++attackers;
+        }
+    }
+
+    U64 knights = (attacker_side == WHITE) ? board->pieces[WHITE_KNIGHT] : board->pieces[BLACK_KNIGHT];
+    attackers += popcount_u64(bitboard_knight_attacks(square) & knights);
+
+    U64 kings = (attacker_side == WHITE) ? board->pieces[WHITE_KING] : board->pieces[BLACK_KING];
+    attackers += popcount_u64(bitboard_king_attacks(square) & kings);
+
+    U64 bishops_and_queens = (attacker_side == WHITE)
+                                 ? (board->pieces[WHITE_BISHOP] | board->pieces[WHITE_QUEEN])
+                                 : (board->pieces[BLACK_BISHOP] | board->pieces[BLACK_QUEEN]);
+    attackers += popcount_u64(bitboard_bishop_attacks(square, board->occupancy[BOTH]) & bishops_and_queens);
+
+    U64 rooks_and_queens = (attacker_side == WHITE)
+                               ? (board->pieces[WHITE_ROOK] | board->pieces[WHITE_QUEEN])
+                               : (board->pieces[BLACK_ROOK] | board->pieces[BLACK_QUEEN]);
+    attackers += popcount_u64(bitboard_rook_attacks(square, board->occupancy[BOTH]) & rooks_and_queens);
+
+    return attackers;
+}
+
 static void count_pawns_per_file(U64 pawns, int pawns_per_file[8]) {
     for (int i = 0; i < 8; ++i) {
         pawns_per_file[i] = 0;
@@ -431,6 +472,14 @@ static float evaluate(Board *board, const RepetitionHistory *history) {
             }
         }
     }
+
+    static const int center_squares[4] = {27, 28, 35, 36}; /* d4, e4, d5, e5 */
+    for (int i = 0; i < 4; ++i) {
+        int square = center_squares[i];
+        white_score += 3.0f*(float)count_attackers_on_square(board, square, WHITE);
+        black_score += 3.0f*(float)count_attackers_on_square(board, square, BLACK);
+    }
+
     //Unless the position is zugzwang, having a move will make the position better
     float tempo_bonus = (endgame == -1) ? 10.0f : 0.0f;
 

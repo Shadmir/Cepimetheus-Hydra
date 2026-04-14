@@ -121,14 +121,14 @@ void uci_loop(void) {
     push_current_position(&board, &history);
 
     SearchOptions options;
-    options.overhead_ms = 50;
+    options.overhead_ms = 100;
 
     char line[4096];
     while (fgets(line, sizeof(line), stdin) != NULL) {
         if (strncmp(line, "uci", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t' || line[3] == '\r' || line[3] == '\n')) {
             printf("id name Cepimetheus\n");
             printf("id author  George Bland\n");
-            printf("option name overhead type spin default 50 min 0 max 10000\n");
+            printf("option name overhead type spin default 100 min 0 max 10000\n");
             printf("uciok\n");
             fflush(stdout);
             continue;
