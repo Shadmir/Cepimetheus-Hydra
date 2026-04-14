@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define MAX_PV_MOVES 128
-#define TRANSITION_TABLE_SIZE 2048
+#define TRANSITION_TABLE_SIZE 1 << 20 /* 1 million entries */
 #define MAX_ORDERED_MOVES 256
 
 typedef struct {
@@ -132,7 +132,7 @@ static void print_depth_info(int depth, const SearchResult *result, const Search
 
 static const int piece_values[6] = {
     100, /* Pawn */
-    310, /* Knight */
+    300, /* Knight */
     320, /* Bishop */
     500, /* Rook */
     950, /* Queen */
@@ -344,43 +344,6 @@ static bool is_endgame_position(const Board *board) {
     return non_king_count <= 4;
 }
 
-static int calculate_dynamic_depth(Board *board, const SearchLimits *limits) {
-    int depth = 4;  /* Base depth. */
-
-    /* +1 if in check. */
-    if (board_is_in_check(board, board->side)) {
-        depth++;
-    }
-
-    /* Count pieces on the board. */
-    int piece_count = count_pieces(board);
-
-    /* +1 if less than 15 pieces. */
-    if (piece_count < 15) {
-        depth++;
-    }
-
-    /* +1 again if less than 10 pieces. */
-    if (piece_count < 10) {
-        depth++;
-    }
-
-    /* -1 if we have less than a minute on the clock. */
-    if (limits != NULL) {
-        int current_time = (board->side == WHITE) ? limits->wtime_ms : limits->btime_ms;
-        if (current_time > 0 && current_time < 60000) {
-            depth--;
-        }
-    }
-
-    /* Ensure depth is at least 1. */
-    if (depth < 1) {
-        depth = 1;
-    }
-
-    return depth;
-}
-
 static float evaluate(Board *board, const RepetitionHistory *history) {
     if (board == NULL) {
         return 0.0f;
@@ -398,9 +361,6 @@ static float evaluate(Board *board, const RepetitionHistory *history) {
         if (board_is_in_check(board, board->side)) {
             /* Checkmate: very bad for side to move. */
             return -100000.0f;
-        } else {
-            /* Stalemate: draw. */
-            return 0.0f;
         }
     }
 
@@ -455,30 +415,42 @@ static float evaluate(Board *board, const RepetitionHistory *history) {
 /* Estimate move score for move ordering. This is intentionally cheap. */
 static int estimate_move_score(Board *board, Move move) {
     int score = 0;
+    int flags = move_flags(move);
 
     /* Captures - MVV/LVA (Most Valuable Victim / Least Valuable Aggressor). */
     if (move_iscapture(board, move)) {
-        int victim_piece = board_piece_at(board, move_to(move));
         int attacker_piece = board_piece_at(board, move_from(move));
-        
-        int victim_value = piece_values[victim_piece];
-        int attacker_value = piece_values[attacker_piece];
+        int attacker_type = board_piece_type(attacker_piece);
 
-        int capture_value = victim_value - attacker_value;
-        score += 1000 + capture_value;
+        int victim_piece = board_piece_at(board, move_to(move));
+        int victim_type;
+
+        if ((flags & MOVE_FLAG_EN_PASSANT) != 0) {
+            victim_type = WHITE_PAWN; /* type 0 */
+        } else {
+            victim_type = board_piece_type(victim_piece);
+        }
+
+        if (attacker_type >= 0 && attacker_type < 6 && victim_type >= 0 && victim_type < 6) {
+            score += 10000 + piece_values[victim_type] * 10 - piece_values[attacker_type];
+        }
     }
 
     /* Promotions. */
     if (move_promotion(move) != MOVE_PROMO_NONE) {
-        score += 9000 + (move_promotion(move) * 100);
+        static const int promo_bonus[5] = {0, 300, 320, 500, 950};
+        int promo = move_promotion(move);
+        if (promo >= 0 && promo <= 4) {
+            score += 20000 + promo_bonus[promo];
+        }
     }
 
     /* Castling. */
-    if ((move_flags(move) & MOVE_FLAG_CASTLE) != 0) {
-        score += 1000;
+    if ((flags & MOVE_FLAG_CASTLE) != 0) {
+        score += 100;
     }
 
-    /* Check if move gives check. I saw online that this is too much computation to be worth considering for move ordering
+    /* Checks (+). I saw online that this is too much computation to be worth considering for move ordering
     Keep the code in case we change our mind
     Undo undo;
     if (board_make_move(board, move, &undo)) {
@@ -700,14 +672,7 @@ static float quiescence(Board *board,
         ranked_moves[i].searched = false;
     }
 
-    for (int i = 0; i < ordered_count; ++i) {
-        Move move = ordered_moves[i];
-        if (move_iscapture(board, move) || move_ischeck(board, move)) {
-            ranked_moves[i].move = move;
-        }
-    }
-
-    /* Search moves. */
+    // Only consider captures and checks in quiescence search.
     for (int i = 0; i < ordered_count; ++i) {
         Move move = ranked_moves[i].move;
         if (!move_iscapture(board, move) && !move_ischeck(board, move)) {
@@ -987,8 +952,8 @@ Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *hi
         /* Explicit depth set via UCI. */
         depth = limits->depth;
     } else {
-        /* Depth not explicitly set, calculate dynamically. */
-        depth = calculate_dynamic_depth(board, limits);
+        /* Default to depth 4 */
+        depth = 4;
     }
 
     RepetitionHistory search_history;
