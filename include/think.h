@@ -3,6 +3,10 @@
 
 #include "movegen.h"
 
+typedef struct SearchOptions {
+    int overhead_ms;
+} SearchOptions;
+
 typedef struct SearchLimits {
     int depth;
     int movetime_ms;
@@ -14,6 +18,6 @@ typedef struct SearchLimits {
     bool infinite;
 } SearchLimits;
 
-Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *history);
+Move think(Board *board, const SearchLimits *limits, const SearchOptions *options, const RepetitionHistory *history);
 
 #endif

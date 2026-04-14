@@ -45,6 +45,35 @@ typedef struct {
     int seldepth;
 } SearchStats;
 
+static long long current_time_ms(void);
+
+typedef struct {
+    bool time_limited;
+    long long stop_time_ms;
+    bool stop;
+} SearchControl;
+
+static bool search_should_stop(SearchControl *control) {
+    if (control == NULL) {
+        return false;
+    }
+
+    if (control->stop) {
+        return true;
+    }
+
+    if (!control->time_limited) {
+        return false;
+    }
+
+    if (current_time_ms() >= control->stop_time_ms) {
+        control->stop = true;
+        return true;
+    }
+
+    return false;
+}
+
 static int estimate_move_score(Board *board, Move move);
 
 /* File masks - one per file (A-H) */
@@ -638,7 +667,12 @@ static float quiescence(Board *board,
                         RepetitionHistory *history,
                         SearchStats *stats,
                         int ply,
-                        TransitionTable *table) {
+                        TransitionTable *table,
+                        SearchControl *control) {
+    if (search_should_stop(control)) {
+        return evaluate(board, history);
+    }
+
     ++stats->nodes;
     if (ply > stats->seldepth) {
         stats->seldepth = ply;
@@ -674,6 +708,10 @@ static float quiescence(Board *board,
 
     // Only consider captures and checks in quiescence search.
     for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
         Move move = ranked_moves[i].move;
         if (!move_iscapture(board, move) && !move_ischeck(board, move)) {
             continue;
@@ -691,7 +729,7 @@ static float quiescence(Board *board,
             continue;
         }
 
-        float score = -quiescence(board, -beta, -alpha, history, stats, ply + 1, table);
+        float score = -quiescence(board, -beta, -alpha, history, stats, ply + 1, table, control);
 
         ranked_moves[i].score = score;
         ranked_moves[i].searched = true;
@@ -726,8 +764,14 @@ static SearchResult negamax(Board *board,
                             RepetitionHistory *history,
                             SearchStats *stats,
                             int ply,
-                            TransitionTable *table) {
+                            TransitionTable *table,
+                            SearchControl *control) {
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+
+    if (search_should_stop(control)) {
+        result.score = evaluate(board, history);
+        return result;
+    }
 
     ++stats->nodes;
 
@@ -759,7 +803,8 @@ static SearchResult negamax(Board *board,
                           history,
                           stats,
                           ply + 1,
-                          table);
+                          table,
+                          control);
         float null_score = -null_child.score;
 
         board_unmake_move(board, &undo);
@@ -772,7 +817,7 @@ static SearchResult negamax(Board *board,
 
     /* Leaf node: run quiescence search. */
     if (depth == 0) {
-        result.score = quiescence(board, alpha, beta, history, stats, ply, table);
+        result.score = quiescence(board, alpha, beta, history, stats, ply, table, control);
         return result;
     }
 
@@ -782,7 +827,7 @@ static SearchResult negamax(Board *board,
 
     /* No moves: run quiescence search on terminal position. */
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta, history, stats, ply, table);
+        result.score = quiescence(board, alpha, beta, history, stats, ply, table, control);
         return result;
     }
 
@@ -797,6 +842,10 @@ static SearchResult negamax(Board *board,
 
     /* Search moves with alpha-beta pruning. */
     for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
         Move move = ordered_moves[i];
         Undo undo;
 
@@ -811,7 +860,7 @@ static SearchResult negamax(Board *board,
             continue;
         }
 
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, ply + 1, table);
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, ply + 1, table, control);
         float score = -child.score;
 
         ranked_moves[i].score = score;
@@ -856,7 +905,8 @@ static SearchResult search_root(Board *board,
                                 int depth,
                                 RepetitionHistory *history,
                                 SearchStats *stats,
-                                TransitionTable *table) {
+                                TransitionTable *table,
+                                SearchControl *control) {
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
     float alpha = -FLT_MAX;
     float beta = FLT_MAX;
@@ -875,7 +925,7 @@ static SearchResult search_root(Board *board,
     }
 
     if (list.count == 0) {
-        result.score = quiescence(board, alpha, beta, history, stats, 0, table);
+        result.score = quiescence(board, alpha, beta, history, stats, 0, table, control);
         return result;
     }
 
@@ -889,6 +939,10 @@ static SearchResult search_root(Board *board,
     }
 
     for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
         Move move = ordered_moves[i];
         Undo undo;
 
@@ -902,7 +956,7 @@ static SearchResult search_root(Board *board,
             continue;
         }
 
-        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, 1, table);
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, 1, table, control);
         float score = -child.score;
 
         ranked_moves[i].score = score;
@@ -942,18 +996,34 @@ static SearchResult search_root(Board *board,
     return result;
 }
 
-Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *history) {
+Move think(Board *board, const SearchLimits *limits, const SearchOptions *options, const RepetitionHistory *history) {
     if (board == NULL) {
         return MOVE_NONE;
     }   
 
-    int depth = 0;
-    if (limits != NULL && limits->depth > 0) {
-        /* Explicit depth set via UCI. */
-        depth = limits->depth;
-    } else {
-        /* Default to depth 4 */
-        depth = 4;
+    int target_depth = 4;
+    int movetime_ms = 0;
+    int overhead_ms = 50;
+    bool depth_explicitly_set = false;
+    const int max_iterative_depth = 64;
+
+    if (options != NULL) {
+        overhead_ms = options->overhead_ms;
+    }
+
+    if (limits != NULL) {
+        if (limits->depth > 0) {
+            target_depth = limits->depth;
+            depth_explicitly_set = true;
+        }
+        if (limits->movetime_ms > 0) {
+            movetime_ms = limits->movetime_ms;
+        }
+    }
+
+    if (movetime_ms > 0 && !depth_explicitly_set) {
+        /* In pure movetime mode, deepen until the time budget is consumed. */
+        target_depth = max_iterative_depth;
     }
 
     RepetitionHistory search_history;
@@ -962,28 +1032,75 @@ Move think(Board *board, const SearchLimits *limits, const RepetitionHistory *hi
         search_history = *history;
     }
 
-    SearchStats stats = {0ULL, depth};
     long long start_time_ms = current_time_ms();
+    int time_to_use_ms = movetime_ms - overhead_ms;
+    if (time_to_use_ms < 10) {
+        time_to_use_ms = 10;
+    }
+
+    SearchControl control = {0};
+    if (movetime_ms > 0) {
+        control.time_limited = true;
+        control.stop_time_ms = start_time_ms + (long long)time_to_use_ms;
+    }
 
     TransitionTable table = {0};
     table.size = TRANSITION_TABLE_SIZE;
     table.entries = calloc(table.size, sizeof(*table.entries));
 
+    SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0};
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
-    result = search_root(board, depth, &search_history, &stats, table.entries != NULL ? &table : NULL);
 
-    long long elapsed_ms = current_time_ms() - start_time_ms;
-    if (elapsed_ms < 0) {
-        elapsed_ms = 0;
+    /* Iterative deepening: search depths 1 through target_depth. */
+    for (int depth = 1; depth <= target_depth; ++depth) {
+        if (movetime_ms > 0) {
+            long long elapsed_before_depth_ms = current_time_ms() - start_time_ms;
+            if (elapsed_before_depth_ms < 0) {
+                elapsed_before_depth_ms = 0;
+            }
+
+            if (elapsed_before_depth_ms >= time_to_use_ms && best_result.move != MOVE_NONE) {
+                break;
+            }
+        }
+
+        SearchStats stats = {0ULL, depth};
+        control.stop = false;
+
+        result = search_root(board,
+                             depth,
+                             &search_history,
+                             &stats,
+                             table.entries != NULL ? &table : NULL,
+                             &control);
+
+        if (control.stop) {
+            break;
+        }
+
+        long long elapsed_ms = current_time_ms() - start_time_ms;
+        if (elapsed_ms < 0) {
+            elapsed_ms = 0;
+        }
+
+        print_depth_info(depth, &result, &stats, elapsed_ms);
+
+        /* Update best result if we have a valid move */
+        if (result.move != MOVE_NONE) {
+            best_result = result;
+        }
+
+        /* Check if we should stop searching */
+        if (movetime_ms > 0 && elapsed_ms >= time_to_use_ms) {
+            break;
+        }
     }
 
-    print_depth_info(depth, &result, &stats, elapsed_ms);
-
-    if (result.move == MOVE_NONE) {
+    if (best_result.move == MOVE_NONE) {
         free(table.entries);
         return MOVE_NONE;
     }
 
     free(table.entries);
-    return result.move;
+    return best_result.move;
 }

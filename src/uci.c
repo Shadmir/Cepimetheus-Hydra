@@ -68,7 +68,7 @@ static void apply_position(Board *board, RepetitionHistory *history, char *line)
     }
 }
 
-static void handle_go(Board *board, RepetitionHistory *history, char *line) {
+static void handle_go(Board *board, RepetitionHistory *history, char *line, const SearchOptions *options) {
     SearchLimits limits;
     memset(&limits, 0, sizeof(limits));
 
@@ -81,6 +81,11 @@ static void handle_go(Board *board, RepetitionHistory *history, char *line) {
                     limits.depth = parsed_depth;
                 }
             }
+        } else if (strcmp(token, "movetime") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                limits.movetime_ms = atoi(value);
+            }
         } else if (strcmp(token, "wtime") == 0) {
             char *value = strtok(NULL, " \t\r\n");
             if (value != NULL) {
@@ -91,10 +96,12 @@ static void handle_go(Board *board, RepetitionHistory *history, char *line) {
             if (value != NULL) {
                 limits.btime_ms = atoi(value);
             }
+        } else if (strcmp(token, "infinite") == 0) {
+            limits.infinite = true;
         }
     }
 
-    Move best = think(board, &limits, history);
+    Move best = think(board, &limits, options, history);
     if (best == MOVE_NONE) {
         printf("bestmove 0000\n");
         fflush(stdout);
@@ -113,11 +120,15 @@ void uci_loop(void) {
     RepetitionHistory history;
     push_current_position(&board, &history);
 
+    SearchOptions options;
+    options.overhead_ms = 50;
+
     char line[4096];
     while (fgets(line, sizeof(line), stdin) != NULL) {
         if (strncmp(line, "uci", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t' || line[3] == '\r' || line[3] == '\n')) {
             printf("id name Cepimetheus\n");
             printf("id author  George Bland\n");
+            printf("option name overhead type spin default 50 min 0 max 10000\n");
             printf("uciok\n");
             fflush(stdout);
             continue;
@@ -126,6 +137,26 @@ void uci_loop(void) {
         if (strncmp(line, "isready", 7) == 0) {
             printf("readyok\n");
             fflush(stdout);
+            continue;
+        }
+
+        if (strncmp(line, "setoption", 9) == 0) {
+            char *nametoken = strstr(line, "name");
+            char *valuetoken = strstr(line, "value");
+            
+            if (nametoken != NULL) {
+                nametoken += 4;
+                while (*nametoken == ' ' || *nametoken == '\t') nametoken++;
+                
+                if (strncmp(nametoken, "overhead", 8) == 0 && valuetoken != NULL) {
+                    valuetoken += 5;
+                    while (*valuetoken == ' ' || *valuetoken == '\t') valuetoken++;
+                    int parsed_overhead = atoi(valuetoken);
+                    if (parsed_overhead >= 0 && parsed_overhead <= 10000) {
+                        options.overhead_ms = parsed_overhead;
+                    }
+                }
+            }
             continue;
         }
 
@@ -141,7 +172,7 @@ void uci_loop(void) {
         }
 
         if (strncmp(line, "go", 2) == 0 && (line[2] == '\0' || line[2] == ' ' || line[2] == '\t' || line[2] == '\r' || line[2] == '\n')) {
-            handle_go(&board, &history, line);
+            handle_go(&board, &history, line, &options);
             continue;
         }
 
