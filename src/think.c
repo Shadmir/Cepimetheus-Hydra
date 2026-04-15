@@ -599,7 +599,7 @@ static bool compute_clock_budget(const Board *board,
     }
 
     int total_ms = base_ms + increment_ms;
-    int soft_ms = (total_ms / 20) - overhead_ms;
+    int soft_ms = (total_ms / 30) - overhead_ms;
     int hard_ms = (total_ms / 10) - overhead_ms;
 
     if (hard_ms < soft_ms) {
