@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#include <sys/time.h>
 
 #define MAX_PV_MOVES 128
 #define TRANSITION_TABLE_SIZE 1 << 20 /* 1 million entries */
@@ -14,6 +15,7 @@ typedef struct {
     Move move;
     Move pv[MAX_PV_MOVES];
     int pv_length;
+    bool forced_root_move;
 } SearchResult;
 
 typedef struct {
@@ -48,8 +50,8 @@ typedef struct {
 static long long current_time_ms(void);
 
 typedef struct {
-    bool time_limited;
-    long long stop_time_ms;
+    bool hard_time_limited;
+    long long hard_stop_time_ms;
     bool stop;
 } SearchControl;
 
@@ -62,11 +64,11 @@ static bool search_should_stop(SearchControl *control) {
         return true;
     }
 
-    if (!control->time_limited) {
+    if (!control->hard_time_limited) {
         return false;
     }
 
-    if (current_time_ms() >= control->stop_time_ms) {
+    if (current_time_ms() >= control->hard_stop_time_ms) {
         control->stop = true;
         return true;
     }
@@ -120,12 +122,12 @@ static void print_move_info(int depth, int move_number, Move move, float score) 
 }
 
 static long long current_time_ms(void) {
-    clock_t now = clock();
-    if (now < 0) {
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0) {
         return 0;
     }
 
-    return (long long)((double)now * 1000.0 / (double)CLOCKS_PER_SEC);
+    return (long long)now.tv_sec * 1000LL + (long long)now.tv_usec / 1000LL;
 }
 
 static unsigned long long compute_nps(unsigned long long nodes, long long elapsed_ms) {
@@ -563,6 +565,52 @@ static int compare_ranked_moves(const void *a, const void *b) {
     return 0;
 }
 
+static int clamp_time_budget(int budget_ms) {
+    if (budget_ms < 10) {
+        return 10;
+    }
+
+    return budget_ms;
+}
+
+static bool compute_clock_budget(const Board *board,
+                                 const SearchLimits *limits,
+                                 const SearchOptions *options,
+                                 int *soft_budget_ms,
+                                 int *hard_budget_ms) {
+    if (board == NULL || limits == NULL || soft_budget_ms == NULL || hard_budget_ms == NULL) {
+        return false;
+    }
+
+    int overhead_ms = 50;
+    if (options != NULL) {
+        overhead_ms = options->overhead_ms;
+    }
+
+    int base_ms = 0;
+    int increment_ms = 0;
+
+    if (board->side == WHITE) {
+        base_ms = limits->wtime_ms;
+        increment_ms = limits->winc_ms;
+    } else {
+        base_ms = limits->btime_ms;
+        increment_ms = limits->binc_ms;
+    }
+
+    int total_ms = base_ms + increment_ms;
+    int soft_ms = (total_ms / 20) - overhead_ms;
+    int hard_ms = (total_ms / 10) - overhead_ms;
+
+    if (hard_ms < soft_ms) {
+        hard_ms = soft_ms;
+    }
+
+    *soft_budget_ms = clamp_time_budget(soft_ms);
+    *hard_budget_ms = clamp_time_budget(hard_ms);
+    return true;
+}
+
 static size_t transition_table_index(const TransitionTable *table, U64 hash) {
     return (size_t)(hash & (table->size - 1U));
 }
@@ -815,7 +863,7 @@ static SearchResult negamax(Board *board,
                             int ply,
                             TransitionTable *table,
                             SearchControl *control) {
-    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
     if (search_should_stop(control)) {
         result.score = evaluate(board, history);
@@ -956,7 +1004,7 @@ static SearchResult search_root(Board *board,
                                 SearchStats *stats,
                                 TransitionTable *table,
                                 SearchControl *control) {
-    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
     float alpha = -FLT_MAX;
     float beta = FLT_MAX;
 
@@ -975,6 +1023,14 @@ static SearchResult search_root(Board *board,
 
     if (list.count == 0) {
         result.score = quiescence(board, alpha, beta, history, stats, 0, table, control);
+        return result;
+    }
+
+    if (list.count == 1) {
+        result.move = list.moves[0];
+        result.pv[0] = list.moves[0];
+        result.pv_length = 1;
+        result.forced_root_move = true;
         return result;
     }
 
@@ -1048,12 +1104,15 @@ static SearchResult search_root(Board *board,
 Move think(Board *board, const SearchLimits *limits, const SearchOptions *options, const RepetitionHistory *history) {
     if (board == NULL) {
         return MOVE_NONE;
-    }   
+    }
 
-    int target_depth = 4;
+    int target_depth = 4; //Default if no limits provided
     int movetime_ms = 0;
+    int soft_time_limit_ms = 0;
+    int hard_time_limit_ms = 0;
     int overhead_ms = 50;
     bool depth_explicitly_set = false;
+    bool time_limited = false;
     const int max_iterative_depth = 64;
 
     if (options != NULL) {
@@ -1067,11 +1126,23 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
         }
         if (limits->movetime_ms > 0) {
             movetime_ms = limits->movetime_ms;
+        } else if (limits->has_clock_time && compute_clock_budget(board, limits, options, &soft_time_limit_ms, &hard_time_limit_ms)) {
+            time_limited = true;
         }
     }
 
     if (movetime_ms > 0 && !depth_explicitly_set) {
         /* In pure movetime mode, deepen until the time budget is consumed. */
+        target_depth = max_iterative_depth;
+    }
+
+    if (movetime_ms > 0) {
+        soft_time_limit_ms = movetime_ms - overhead_ms;
+        hard_time_limit_ms = soft_time_limit_ms;
+        soft_time_limit_ms = clamp_time_budget(soft_time_limit_ms);
+        hard_time_limit_ms = clamp_time_budget(hard_time_limit_ms);
+        time_limited = true;
+    } else if (time_limited && !depth_explicitly_set) {
         target_depth = max_iterative_depth;
     }
 
@@ -1082,33 +1153,29 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
     }
 
     long long start_time_ms = current_time_ms();
-    int time_to_use_ms = movetime_ms - overhead_ms;
-    if (time_to_use_ms < 10) {
-        time_to_use_ms = 10;
-    }
 
     SearchControl control = {0};
-    if (movetime_ms > 0) {
-        control.time_limited = true;
-        control.stop_time_ms = start_time_ms + (long long)time_to_use_ms;
+    if (time_limited) {
+        control.hard_time_limited = true;
+        control.hard_stop_time_ms = start_time_ms + (long long)hard_time_limit_ms;
     }
 
     TransitionTable table = {0};
     table.size = TRANSITION_TABLE_SIZE;
     table.entries = calloc(table.size, sizeof(*table.entries));
 
-    SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0};
-    SearchResult result = {0.0f, MOVE_NONE, {0}, 0};
+    SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0, false};
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
     /* Iterative deepening: search depths 1 through target_depth. */
     for (int depth = 1; depth <= target_depth; ++depth) {
-        if (movetime_ms > 0) {
+        if (time_limited) {
             long long elapsed_before_depth_ms = current_time_ms() - start_time_ms;
             if (elapsed_before_depth_ms < 0) {
                 elapsed_before_depth_ms = 0;
             }
 
-            if (elapsed_before_depth_ms >= time_to_use_ms && best_result.move != MOVE_NONE) {
+            if (elapsed_before_depth_ms >= soft_time_limit_ms && best_result.move != MOVE_NONE) {
                 break;
             }
         }
@@ -1139,8 +1206,13 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
             best_result = result;
         }
 
+        // If the root search resulted in only one legal move then we can stop searching immediately, no matter the time limits, as we won't find a better move by searching deeper
+        if (result.forced_root_move) {
+            break;
+        }
+
         /* Check if we should stop searching */
-        if (movetime_ms > 0 && elapsed_ms >= time_to_use_ms) {
+        if (time_limited && elapsed_ms >= soft_time_limit_ms) {
             break;
         }
     }

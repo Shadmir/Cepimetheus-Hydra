@@ -90,11 +90,25 @@ static void handle_go(Board *board, RepetitionHistory *history, char *line, cons
             char *value = strtok(NULL, " \t\r\n");
             if (value != NULL) {
                 limits.wtime_ms = atoi(value);
+                limits.has_clock_time = true;
             }
         } else if (strcmp(token, "btime") == 0) {
             char *value = strtok(NULL, " \t\r\n");
             if (value != NULL) {
                 limits.btime_ms = atoi(value);
+                limits.has_clock_time = true;
+            }
+        } else if (strcmp(token, "winc") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                limits.winc_ms = atoi(value);
+                limits.has_clock_time = true;
+            }
+        } else if (strcmp(token, "binc") == 0) {
+            char *value = strtok(NULL, " \t\r\n");
+            if (value != NULL) {
+                limits.binc_ms = atoi(value);
+                limits.has_clock_time = true;
             }
         } else if (strcmp(token, "infinite") == 0) {
             limits.infinite = true;

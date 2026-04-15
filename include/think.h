@@ -15,6 +15,7 @@ typedef struct SearchLimits {
     int winc_ms;
     int binc_ms;
     int movestogo;
+    bool has_clock_time;
     bool infinite;
 } SearchLimits;
 
