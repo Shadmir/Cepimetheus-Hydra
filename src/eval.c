@@ -96,15 +96,15 @@ static int count_king_ring_attackers(const Board *board, int king_side) {
 
     int attacker_side = (king_side == WHITE) ? BLACK : WHITE;
     U64 ring = bitboard_king_attacks(king_square);
-    U64 attackers = 0ULL;
+    int attackers = 0;
 
     U64 bb = ring;
     while (bb) {
         int square = bitboard_pop_lsb(&bb);
-        attackers |= count_attackers_on_square(board, square, attacker_side);
+        attackers += count_attackers_on_square(board, square, attacker_side);
     }
 
-    return popcount_u64(attackers);
+    return attackers;
 }
 
 static void count_pawns_per_file(U64 pawns, int pawns_per_file[8]) {
@@ -218,7 +218,8 @@ static float evaluate_piece(const Board *board,
     }
 
     if (type == WHITE_BISHOP) {
-        /* Reward bishops with mobility through pawn occupancy only. */
+        /* Reward bishops with mobility through pawn occupancy only. 
+        This is because a bishop on g2 with a knight on f3 is still good whereas if there was a pawn on f3 it would be blocked*/
         U64 pawn_occupancy = board->pieces[WHITE_PAWN] | board->pieces[BLACK_PAWN];
         return piece_value + 1.5f * (float)popcount_u64(bitboard_bishop_attacks(square, pawn_occupancy));
     }
