@@ -7,6 +7,8 @@ TARGET := Cepimetheus
 SRC := \
 	src/main.c \
 	src/uci.c \
+	src/eval.c \
+	src/search.c \
 	src/think.c \
 	src/movegen.c \
 	src/move.c \

@@ -1,0 +1,651 @@
+#include "../include/search.h"
+
+#include "eval.h"
+#include "movegen.h"
+
+#include <float.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+
+#define TRANSITION_TABLE_SIZE (1U << 20) /* 1 million entries */
+#define MAX_ORDERED_MOVES 256
+
+typedef struct {
+    Move move;
+    int score;
+} ScoredMove;
+
+typedef struct {
+    Move move;
+    float score;
+    bool searched;
+} RankedMove;
+
+typedef struct {
+    bool valid;
+    U64 hash;
+    int depth;
+    int move_count;
+    Move moves[MAX_ORDERED_MOVES];
+} TransitionEntry;
+
+typedef struct {
+    TransitionEntry *entries;
+    size_t size;
+} TransitionTable;
+
+struct SearchContext {
+    TransitionTable table;
+};
+
+static const int piece_values[6] = {
+    100, /* Pawn */
+    300, /* Knight */
+    320, /* Bishop */
+    500, /* Rook */
+    950, /* Queen */
+    0    /* King */
+};
+
+static long long current_time_ms(void) {
+    struct timeval now;
+    if (gettimeofday(&now, NULL) != 0) {
+        return 0;
+    }
+
+    return (long long)now.tv_sec * 1000LL + (long long)now.tv_usec / 1000LL;
+}
+
+static bool search_should_stop(SearchControl *control) {
+    if (control == NULL) {
+        return false;
+    }
+
+    if (control->stop) {
+        return true;
+    }
+
+    if (!control->hard_time_limited) {
+        return false;
+    }
+
+    if (current_time_ms() >= control->hard_stop_time_ms) {
+        control->stop = true;
+        return true;
+    }
+
+    return false;
+}
+
+/* Estimate move score for move ordering. This is intentionally cheap. */
+static int estimate_move_score(Board *board, Move move) {
+    int score = 0;
+    int flags = move_flags(move);
+
+    /* Captures - MVV/LVA (Most Valuable Victim / Least Valuable Aggressor). */
+    if (move_iscapture(board, move)) {
+        int attacker_piece = board_piece_at(board, move_from(move));
+        int attacker_type = board_piece_type(attacker_piece);
+
+        int victim_piece = board_piece_at(board, move_to(move));
+        int victim_type;
+
+        if ((flags & MOVE_FLAG_EN_PASSANT) != 0) {
+            victim_type = WHITE_PAWN; /* type 0 */
+        } else {
+            victim_type = board_piece_type(victim_piece);
+        }
+
+        if (attacker_type >= 0 && attacker_type < 6 && victim_type >= 0 && victim_type < 6) {
+            score += 10000 + piece_values[victim_type] * 10 - piece_values[attacker_type];
+        }
+    }
+
+    /* Promotions. */
+    if (move_promotion(move) != MOVE_PROMO_NONE) {
+        static const int promo_bonus[5] = {0, 300, 320, 500, 950};
+        int promo = move_promotion(move);
+        if (promo >= 0 && promo <= 4) {
+            score += 20000 + promo_bonus[promo];
+        }
+    }
+
+    /* Castling. */
+    if ((flags & MOVE_FLAG_CASTLE) != 0) {
+        score += 100;
+    }
+
+    return score;
+}
+
+/* Compare function for qsort - sort in descending order of score. */
+static int compare_scored_moves(const void *a, const void *b) {
+    const ScoredMove *move_a = (const ScoredMove *)a;
+    const ScoredMove *move_b = (const ScoredMove *)b;
+    return move_b->score - move_a->score;
+}
+
+static int compare_ranked_moves(const void *a, const void *b) {
+    const RankedMove *move_a = (const RankedMove *)a;
+    const RankedMove *move_b = (const RankedMove *)b;
+
+    if (move_a->score < move_b->score) {
+        return 1;
+    }
+
+    if (move_a->score > move_b->score) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static size_t transition_table_index(const TransitionTable *table, U64 hash) {
+    return (size_t)(hash & (table->size - 1U));
+}
+
+static const TransitionEntry *transition_table_lookup(const TransitionTable *table, U64 hash) {
+    if (table == NULL || table->entries == NULL || table->size == 0) {
+        return NULL;
+    }
+
+    const TransitionEntry *entry = &table->entries[transition_table_index(table, hash)];
+    if (!entry->valid || entry->hash != hash) {
+        return NULL;
+    }
+
+    return entry;
+}
+
+static void transition_table_store(TransitionTable *table, U64 hash, int depth, const Move *moves, int move_count) {
+    if (table == NULL || table->entries == NULL || table->size == 0 || moves == NULL || move_count <= 0) {
+        return;
+    }
+
+    if (move_count > MAX_ORDERED_MOVES) {
+        move_count = MAX_ORDERED_MOVES;
+    }
+
+    TransitionEntry *entry = &table->entries[transition_table_index(table, hash)];
+    if (entry->valid && entry->hash == hash && depth <= entry->depth) {
+        return;
+    }
+
+    if (entry->valid && entry->hash != hash && depth <= entry->depth) {
+        return;
+    }
+
+    entry->valid = true;
+    entry->hash = hash;
+    entry->depth = depth;
+    entry->move_count = move_count;
+    memcpy(entry->moves, moves, (size_t)move_count * sizeof(Move));
+}
+
+static int find_move_index(const MoveList *list, Move move) {
+    if (list == NULL) {
+        return -1;
+    }
+
+    for (int i = 0; i < list->count; ++i) {
+        if (list->moves[i] == move) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+static int build_ordered_moves(Board *board,
+                               const MoveList *list,
+                               const TransitionTable *table,
+                               Move ordered_moves[MAX_ORDERED_MOVES]) {
+    if (board == NULL || list == NULL || ordered_moves == NULL || list->count <= 0) {
+        return 0;
+    }
+
+    U64 hash = board_position_key(board);
+    const TransitionEntry *entry = transition_table_lookup(table, hash);
+
+    if (entry == NULL) {
+        ScoredMove scored_moves[MAX_ORDERED_MOVES];
+        int scored_count = 0;
+        for (int i = 0; i < list->count && i < MAX_ORDERED_MOVES; ++i) {
+            scored_moves[scored_count].move = list->moves[i];
+            scored_moves[scored_count].score = estimate_move_score(board, list->moves[i]);
+            ++scored_count;
+        }
+
+        qsort(scored_moves, (size_t)scored_count, sizeof(ScoredMove), compare_scored_moves);
+        for (int i = 0; i < scored_count; ++i) {
+            ordered_moves[i] = scored_moves[i].move;
+        }
+
+        return scored_count;
+    }
+
+    bool used[MAX_ORDERED_MOVES] = {false};
+    int ordered_count = 0;
+
+    for (int i = 0; i < entry->move_count && ordered_count < list->count; ++i) {
+        Move move = entry->moves[i];
+        int index = find_move_index(list, move);
+        if (index >= 0 && !used[index]) {
+            ordered_moves[ordered_count++] = move;
+            used[index] = true;
+        }
+    }
+
+    ScoredMove fallback_moves[MAX_ORDERED_MOVES];
+    int fallback_count = 0;
+    for (int i = 0; i < list->count && fallback_count < MAX_ORDERED_MOVES; ++i) {
+        if (used[i]) {
+            continue;
+        }
+
+        fallback_moves[fallback_count].move = list->moves[i];
+        fallback_moves[fallback_count].score = estimate_move_score(board, list->moves[i]);
+        ++fallback_count;
+    }
+
+    qsort(fallback_moves, (size_t)fallback_count, sizeof(ScoredMove), compare_scored_moves);
+    for (int i = 0; i < fallback_count && ordered_count < MAX_ORDERED_MOVES; ++i) {
+        ordered_moves[ordered_count++] = fallback_moves[i].move;
+    }
+
+    return ordered_count;
+}
+
+static int finalize_move_order(const RankedMove *ranked_moves, int move_count, Move final_order[MAX_ORDERED_MOVES]) {
+    if (ranked_moves == NULL || final_order == NULL || move_count <= 0) {
+        return 0;
+    }
+
+    RankedMove searched_moves[MAX_ORDERED_MOVES];
+    int searched_count = 0;
+
+    for (int i = 0; i < move_count && i < MAX_ORDERED_MOVES; ++i) {
+        if (ranked_moves[i].searched) {
+            searched_moves[searched_count++] = ranked_moves[i];
+        }
+    }
+
+    qsort(searched_moves, (size_t)searched_count, sizeof(RankedMove), compare_ranked_moves);
+
+    int final_count = 0;
+    for (int i = 0; i < searched_count && final_count < MAX_ORDERED_MOVES; ++i) {
+        final_order[final_count++] = searched_moves[i].move;
+    }
+
+    for (int i = 0; i < move_count && final_count < MAX_ORDERED_MOVES; ++i) {
+        if (!ranked_moves[i].searched) {
+            final_order[final_count++] = ranked_moves[i].move;
+        }
+    }
+
+    return final_count;
+}
+
+/* Quiescence search: only explores captures and checks. */
+static float quiescence(Board *board,
+                        float alpha,
+                        float beta,
+                        RepetitionHistory *history,
+                        SearchStats *stats,
+                        int ply,
+                        TransitionTable *table,
+                        SearchControl *control) {
+    if (search_should_stop(control)) {
+        return evaluate_position(board, history, ply);
+    }
+
+    ++stats->nodes;
+    if (ply > stats->seldepth) {
+        stats->seldepth = ply;
+    }
+
+    if (board_is_draw(board, history)) {
+        return 0.0f;
+    }
+
+    /* Stand-pat: evaluate current position. */
+    float stand_pat = evaluate_position(board, history, ply);
+
+    if (stand_pat >= beta) {
+        return beta;
+    }
+
+    if (stand_pat > alpha) {
+        alpha = stand_pat;
+    }
+
+    MoveList list;
+    movegen_generate_legal(board, &list);
+
+    Move ordered_moves[MAX_ORDERED_MOVES];
+    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
+
+    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
+    for (int i = 0; i < ordered_count; ++i) {
+        ranked_moves[i].move = ordered_moves[i];
+        ranked_moves[i].searched = false;
+    }
+
+    for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
+        Move move = ranked_moves[i].move;
+        if (!move_iscapture(board, move) && !move_ischeck(board, move)) {
+            continue;
+        }
+
+        Undo undo;
+
+        if (!board_make_move(board, move, &undo)) {
+            continue;
+        }
+
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        float score = -quiescence(board, -beta, -alpha, history, stats, ply + 1, table, control);
+
+        ranked_moves[i].score = score;
+        ranked_moves[i].searched = true;
+
+        --history->count;
+
+        board_unmake_move(board, &undo);
+
+        if (score >= beta) {
+            return beta;
+        }
+
+        if (score > alpha) {
+            alpha = score;
+        }
+    }
+
+    Move final_order[MAX_ORDERED_MOVES];
+    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
+    if (final_count > 0) {
+        transition_table_store(table, board_position_key(board), 0, final_order, final_count);
+    }
+
+    return alpha;
+}
+
+/* Alpha-beta pruned negamax search. */
+static SearchResult negamax(Board *board,
+                            int depth,
+                            float alpha,
+                            float beta,
+                            RepetitionHistory *history,
+                            SearchStats *stats,
+                            int ply,
+                            TransitionTable *table,
+                            SearchControl *control) {
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
+
+    if (search_should_stop(control)) {
+        result.score = evaluate_position(board, history, ply);
+        return result;
+    }
+
+    ++stats->nodes;
+
+    if (board_is_draw(board, history)) {
+        result.score = 0.0f;
+        return result;
+    }
+
+    /* Null-move pruning, avoided in endgames to avoid zugzwang issues. */
+    if (depth >= 3 &&
+        beta < 10000.0f &&
+        !board_is_in_check(board, board->side) &&
+        !eval_is_endgame_position(board)) {
+        const int reduction = 2;
+        Undo undo;
+        undo.snapshot = *board;
+
+        if (board->side == BLACK) {
+            ++board->fullmove_number;
+        }
+        board->side ^= 1;
+        board->ep_square = -1;
+        ++board->halfmove_clock;
+
+        SearchResult null_child = negamax(board,
+                                          depth - 1 - reduction,
+                                          -beta,
+                                          -beta + 1.0f,
+                                          history,
+                                          stats,
+                                          ply + 1,
+                                          table,
+                                          control);
+        float null_score = -null_child.score;
+
+        board_unmake_move(board, &undo);
+
+        if (null_score >= beta) {
+            result.score = beta;
+            return result;
+        }
+    }
+
+    if (depth == 0) {
+        result.score = quiescence(board, alpha, beta, history, stats, ply, table, control);
+        return result;
+    }
+
+    MoveList list;
+    movegen_generate_legal(board, &list);
+
+    if (list.count == 0) {
+        result.score = quiescence(board, alpha, beta, history, stats, ply, table, control);
+        return result;
+    }
+
+    Move ordered_moves[MAX_ORDERED_MOVES];
+    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
+
+    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
+    for (int i = 0; i < ordered_count; ++i) {
+        ranked_moves[i].move = ordered_moves[i];
+        ranked_moves[i].searched = false;
+    }
+
+    for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
+        Move move = ordered_moves[i];
+        Undo undo;
+
+        if (!board_make_move(board, move, &undo)) {
+            continue;
+        }
+
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, ply + 1, table, control);
+        float score = -child.score;
+
+        ranked_moves[i].score = score;
+        ranked_moves[i].searched = true;
+
+        --history->count;
+
+        board_unmake_move(board, &undo);
+
+        if (score > result.score || result.move == MOVE_NONE) {
+            result.score = score;
+            result.move = move;
+            result.pv[0] = move;
+            result.pv_length = 1;
+            for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
+                result.pv[result.pv_length++] = child.pv[j];
+            }
+        }
+
+        if (score > alpha) {
+            alpha = score;
+        }
+
+        if (alpha >= beta) {
+            break;
+        }
+    }
+
+    Move final_order[MAX_ORDERED_MOVES];
+    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
+    if (final_count > 0) {
+        transition_table_store(table, board_position_key(board), depth, final_order, final_count);
+    }
+
+    return result;
+}
+
+SearchContext *search_context_create(void) {
+    SearchContext *context = calloc(1, sizeof(*context));
+    if (context == NULL) {
+        return NULL;
+    }
+
+    context->table.size = TRANSITION_TABLE_SIZE;
+    context->table.entries = calloc(context->table.size, sizeof(*context->table.entries));
+    return context;
+}
+
+void search_context_destroy(SearchContext *context) {
+    if (context == NULL) {
+        return;
+    }
+
+    free(context->table.entries);
+    free(context);
+}
+
+SearchResult search_root(Board *board,
+                         int depth,
+                         RepetitionHistory *history,
+                         SearchStats *stats,
+                         SearchContext *context,
+                         SearchControl *control,
+                         SearchMoveInfoCallback on_move_info,
+                         void *user_data) {
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
+    float alpha = -FLT_MAX;
+    float beta = FLT_MAX;
+
+    TransitionTable *table = NULL;
+    if (context != NULL && context->table.entries != NULL) {
+        table = &context->table;
+    }
+
+    MoveList list;
+    movegen_generate_legal(board, &list);
+
+    if (board_is_draw(board, history)) {
+        result.score = 0.0f;
+        if (list.count > 0) {
+            result.move = list.moves[0];
+            result.pv[0] = list.moves[0];
+            result.pv_length = 1;
+        }
+        return result;
+    }
+
+    if (list.count == 0) {
+        result.score = quiescence(board, alpha, beta, history, stats, 0, table, control);
+        return result;
+    }
+
+    if (list.count == 1) {
+        result.move = list.moves[0];
+        result.pv[0] = list.moves[0];
+        result.pv_length = 1;
+        result.forced_root_move = true;
+        return result;
+    }
+
+    Move ordered_moves[MAX_ORDERED_MOVES];
+    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
+
+    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
+    for (int i = 0; i < ordered_count; ++i) {
+        ranked_moves[i].move = ordered_moves[i];
+        ranked_moves[i].searched = false;
+    }
+
+    for (int i = 0; i < ordered_count; ++i) {
+        if (search_should_stop(control)) {
+            break;
+        }
+
+        Move move = ordered_moves[i];
+        Undo undo;
+
+        if (!board_make_move(board, move, &undo)) {
+            continue;
+        }
+
+        U64 key = board_position_key(board);
+        if (!repetition_history_push(history, key)) {
+            board_unmake_move(board, &undo);
+            continue;
+        }
+
+        SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, 1, table, control);
+        float score = -child.score;
+
+        ranked_moves[i].score = score;
+        ranked_moves[i].searched = true;
+
+        --history->count;
+
+        board_unmake_move(board, &undo);
+
+        if (on_move_info != NULL) {
+            on_move_info(depth, i + 1, move, score, user_data);
+        }
+
+        if (score > result.score || result.move == MOVE_NONE) {
+            result.score = score;
+            result.move = move;
+            result.pv[0] = move;
+            result.pv_length = 1;
+            for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
+                result.pv[result.pv_length++] = child.pv[j];
+            }
+        }
+
+        if (score > alpha) {
+            alpha = score;
+        }
+
+        if (alpha >= beta) {
+            break;
+        }
+    }
+
+    Move final_order[MAX_ORDERED_MOVES];
+    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
+    if (final_count > 0) {
+        transition_table_store(table, board_position_key(board), depth, final_order, final_count);
+    }
+
+    return result;
+}
