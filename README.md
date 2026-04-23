@@ -15,5 +15,5 @@ make
 Start the engine binary and speak UCI over stdin/stdout:
 
 ```sh
-./chess2
+./Cepimetheus
 ```

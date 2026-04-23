@@ -233,6 +233,25 @@ static int count_attackers_on_square(const Board *board, int square, int attacke
     return attackers;
 }
 
+static int count_king_ring_attackers(const Board *board, int king_side) {
+    int king_square = board->king_square[king_side];
+    if (king_square < 0 || king_square >= 64) {
+        return 0;
+    }
+
+    int attacker_side = (king_side == WHITE) ? BLACK : WHITE;
+    U64 ring = bitboard_king_attacks(king_square);
+    U64 attackers = 0ULL;
+
+    U64 bb = ring;
+    while (bb) {
+        int square = bitboard_pop_lsb(&bb);
+        attackers |= count_attackers_on_square(board, square, attacker_side);
+    }
+
+    return popcount_u64(attackers);
+}
+
 static void count_pawns_per_file(U64 pawns, int pawns_per_file[8]) {
     for (int i = 0; i < 8; ++i) {
         pawns_per_file[i] = 0;
@@ -362,7 +381,7 @@ static float evaluate_piece(const Board *board,
     }
     // If nothing prior it is a king
     if (endgame == -1) {
-        //In the opening/midgame, king safety is important. Penalise kings with more possible attacks against them.
+        //In the opening/midgame, king safety is important. Penalise kings the more open they are.
         piece_value -= (float)popcount_u64(bitboard_queen_attacks(square, board->occupancy[BOTH]));
     }
     //Calculate Manhattan distance to closest corner
@@ -476,12 +495,16 @@ static float evaluate(Board *board, const RepetitionHistory *history, int ply) {
         }
     }
 
+    //Centre control
     static const int center_squares[4] = {27, 28, 35, 36}; /* d4, e4, d5, e5 */
     for (int i = 0; i < 4; ++i) {
         int square = center_squares[i];
         white_score += 3.0f*(float)count_attackers_on_square(board, square, WHITE);
         black_score += 3.0f*(float)count_attackers_on_square(board, square, BLACK);
     }
+
+    white_score -= 2.0f * (float)count_king_ring_attackers(board, WHITE);
+    black_score -= 2.0f * (float)count_king_ring_attackers(board, BLACK);
 
     //Unless the position is zugzwang, having a move will make the position better
     float tempo_bonus = (endgame == -1) ? 10.0f : 0.0f;
