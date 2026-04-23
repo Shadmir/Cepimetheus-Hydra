@@ -9,6 +9,7 @@
 #define MAX_PV_MOVES 128
 #define TRANSITION_TABLE_SIZE 1 << 20 /* 1 million entries */
 #define MAX_ORDERED_MOVES 256
+#define MATE_SCORE 100000.0f
 
 typedef struct {
     float score;
@@ -416,7 +417,7 @@ static bool is_endgame_position(const Board *board) {
     return non_king_count <= 4;
 }
 
-static float evaluate(Board *board, const RepetitionHistory *history) {
+static float evaluate(Board *board, const RepetitionHistory *history, int ply) {
     if (board == NULL) {
         return 0.0f;
     }
@@ -432,7 +433,7 @@ static float evaluate(Board *board, const RepetitionHistory *history) {
         /* No legal moves: checkmate or stalemate. */
         if (board_is_in_check(board, board->side)) {
             /* Checkmate: very bad for side to move. */
-            return -100000.0f;
+            return -MATE_SCORE + (float)ply;
         }
     }
 
@@ -767,7 +768,7 @@ static float quiescence(Board *board,
                         TransitionTable *table,
                         SearchControl *control) {
     if (search_should_stop(control)) {
-        return evaluate(board, history);
+        return evaluate(board, history, ply);
     }
 
     ++stats->nodes;
@@ -780,7 +781,7 @@ static float quiescence(Board *board,
     }
 
     /* Stand-pat: evaluate current position. */
-    float stand_pat = evaluate(board, history);
+    float stand_pat = evaluate(board, history, ply);
 
     if (stand_pat >= beta) {
         return beta;
@@ -866,7 +867,7 @@ static SearchResult negamax(Board *board,
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
     if (search_should_stop(control)) {
-        result.score = evaluate(board, history);
+        result.score = evaluate(board, history, ply);
         return result;
     }
 
