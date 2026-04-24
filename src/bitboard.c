@@ -88,14 +88,11 @@ int bitboard_pop_lsb(U64 *bitboard) {
     if (*bitboard == 0) {
         return -1;
     }
-    for (int square = 0; square < 64; ++square) {
-        U64 mask = 1ULL << square;
-        if (*bitboard & mask) {
-            *bitboard &= ~mask;
-            return square;
-        }
-    }
-    return -1;
+
+    U64 value = *bitboard;
+    int square = __builtin_ctzll(value);
+    *bitboard = value & (value - 1ULL);
+    return square;
 }
 
 U64 bitboard_knight_attacks(int square) {
