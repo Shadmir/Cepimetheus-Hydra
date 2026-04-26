@@ -13,7 +13,7 @@ pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make
 Then build:
 
 ```sh
-make
+mingw32-make
 ```
 
 For a Windows `.exe` (cross-compile from Linux/MSYS2):
