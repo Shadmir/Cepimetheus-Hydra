@@ -32,6 +32,13 @@ windows:
 	$(MAKE) clean
 	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus-Hydra.exe THREAD_FLAGS='-pthread -static -static-libgcc'
 
-
+ifeq ($(OS),Windows_NT)
+WIN_OBJ := $(subst /,\,$(OBJ))
+clean:
+	-del /f /q $(WIN_OBJ) 2>nul
+	-del /f /q Cepimetheus-Hydra.exe 2>nul
+	-del /f /q Cepimetheus-Hydra 2>nul
+else
 clean:
 	rm -f $(OBJ) $(TARGET) Cepimetheus-Hydra.exe
+endif
