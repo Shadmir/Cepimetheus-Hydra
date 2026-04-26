@@ -5,6 +5,7 @@
 
 typedef struct SearchOptions {
     int overhead_ms;
+    int threads;
 } SearchOptions;
 
 typedef struct SearchLimits {

@@ -163,6 +163,9 @@ static const TranspositionEntry *transposition_table_lookup(const TranspositionT
     return entry;
 }
 
+/* NOTE: Called concurrently by Lazy SMP worker threads without locking.
+ * A partial write causes a hash mismatch on lookup, which is treated as a
+ * cache miss — safe. This benign data race is intentional (standard practice). */
 static void transposition_table_store(TranspositionTable *table, U64 hash, int depth, const Move *moves, int move_count) {
     if (table == NULL || table->entries == NULL || table->size == 0 || moves == NULL || move_count <= 0) {
         return;

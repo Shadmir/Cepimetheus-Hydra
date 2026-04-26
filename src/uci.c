@@ -246,6 +246,7 @@ void uci_loop(void) {
 
     SearchOptions options;
     options.overhead_ms = 100;
+    options.threads = 1;
 
     SearchThreadState search_thread = {0};
     pthread_mutex_init(&search_thread.mutex, NULL);
@@ -258,6 +259,7 @@ void uci_loop(void) {
             printf("id name Cepimetheus\n");
             printf("id author  George Bland\n");
             printf("option name overhead type spin default 100 min 0 max 10000\n");
+            printf("option name Threads type spin default 1 min 1 max 256\n");
             printf("uciok\n");
             fflush(stdout);
             continue;
@@ -283,6 +285,13 @@ void uci_loop(void) {
                     int parsed_overhead = atoi(valuetoken);
                     if (parsed_overhead >= 0 && parsed_overhead <= 10000) {
                         options.overhead_ms = parsed_overhead;
+                    }
+                } else if (strncmp(nametoken, "Threads", 7) == 0 && valuetoken != NULL) {
+                    valuetoken += 5;
+                    while (*valuetoken == ' ' || *valuetoken == '\t') valuetoken++;
+                    int parsed_threads = atoi(valuetoken);
+                    if (parsed_threads >= 1 && parsed_threads <= 256) {
+                        options.threads = parsed_threads;
                     }
                 }
             }

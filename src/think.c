@@ -2,6 +2,7 @@
 #include "../include/search.h"
 
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -121,6 +122,31 @@ static bool compute_clock_budget(const Board *board,
 }
 
 
+typedef struct {
+    Board board;
+    RepetitionHistory history;
+    SearchContext *context;      /* shared TT pointer — not owned */
+    SearchControl control;
+} SmpWorkerTask;
+
+static void *smp_worker_main(void *arg) {
+    SmpWorkerTask *task = (SmpWorkerTask *)arg;
+    SearchStats stats = {0};
+    for (int depth = 1; depth < INT_MAX; depth++) {
+        bool should_stop = task->control.stop;
+        if (!should_stop && task->control.external_stop != NULL) {
+            should_stop = *task->control.external_stop;
+        }
+        if (should_stop) break;
+        stats.seldepth = depth;
+        stats.nodes = 0;
+        search_root(&task->board, depth, &task->history, &stats,
+                    task->context, &task->control, NULL, NULL);
+        if (task->control.stop) break;
+    }
+    return NULL;
+}
+
 Move think(Board *board,
            const SearchLimits *limits,
            const SearchOptions *options,
@@ -192,6 +218,36 @@ Move think(Board *board,
 
     SearchContext *search_context = search_context_create();
 
+    /* Lazy SMP: spawn N-1 helper threads sharing the same TT */
+    int num_threads = (options != NULL && options->threads > 0) ? options->threads : 1;
+    int num_workers = num_threads - 1;
+    volatile bool smp_stop = false;
+    pthread_t *worker_threads = NULL;
+    SmpWorkerTask *worker_tasks = NULL;
+
+    if (num_workers > 0) {
+        worker_threads = calloc((size_t)num_workers, sizeof(pthread_t));
+        worker_tasks   = calloc((size_t)num_workers, sizeof(SmpWorkerTask));
+        if (worker_threads == NULL || worker_tasks == NULL) {
+            free(worker_threads);
+            free(worker_tasks);
+            worker_threads = NULL;
+            worker_tasks   = NULL;
+            num_workers    = 0;
+        }
+    }
+    for (int i = 0; i < num_workers; i++) {
+        worker_tasks[i].board   = *board;
+        worker_tasks[i].history = search_history;
+        worker_tasks[i].context = search_context;
+        worker_tasks[i].control = (SearchControl){0};
+        worker_tasks[i].control.external_stop = &smp_stop;
+        if (pthread_create(&worker_threads[i], NULL, smp_worker_main, &worker_tasks[i]) != 0) {
+            num_workers = i;  /* shrink on failure, remaining slots unused */
+            break;
+        }
+    }
+
     SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0, false};
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
@@ -203,6 +259,7 @@ Move think(Board *board,
 
     for (int depth = 1; depth <= depth_limit; ++depth) {
         if (stop_signal != NULL && *stop_signal) {
+            smp_stop = true;
             break;
         }
 
@@ -213,6 +270,7 @@ Move think(Board *board,
             }
 
             if (elapsed_before_depth_ms >= soft_time_limit_ms && best_result.move != MOVE_NONE) {
+                smp_stop = true;
                 break;
             }
         }
@@ -230,6 +288,7 @@ Move think(Board *board,
                              NULL);
 
         if (control.stop) {
+            smp_stop = true;
             break;
         }
 
@@ -247,14 +306,24 @@ Move think(Board *board,
 
         // If the root search resulted in only one legal move then we can stop searching immediately, no matter the time limits, as we won't find a better move by searching deeper
         if (result.forced_root_move) {
+            smp_stop = true;
             break;
         }
 
         /* Check if we should stop searching */
         if (time_limited && elapsed_ms >= soft_time_limit_ms) {
+            smp_stop = true;
             break;
         }
     }
+
+    /* Signal workers to stop and wait for them before destroying shared context */
+    smp_stop = true;
+    for (int i = 0; i < num_workers; i++) {
+        pthread_join(worker_threads[i], NULL);
+    }
+    free(worker_threads);
+    free(worker_tasks);
 
     if (best_result.move == MOVE_NONE) {
         search_context_destroy(search_context);
