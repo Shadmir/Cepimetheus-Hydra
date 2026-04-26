@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make)",
+      "Bash(gcc --version)",
+      "Read(//c/ProgramData/chocolatey/bin/**)",
+      "Read(//c/Program Files/**)",
+      "Bash(find /c -name \"gcc.exe\" -maxdepth 6)"
+    ]
+  }
+}
