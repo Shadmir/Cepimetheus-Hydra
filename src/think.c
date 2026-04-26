@@ -128,13 +128,15 @@ typedef struct {
     SearchContext *context;           /* shared TT pointer — not owned */
     SearchControl control;
     unsigned long long total_nodes;   /* written by worker on exit, read by main after join */
+    int start_depth;                  /* staggered start to avoid redundant work */
 } SmpWorkerTask;
 
 static void *smp_worker_main(void *arg) {
     SmpWorkerTask *task = (SmpWorkerTask *)arg;
     unsigned long long total_nodes = 0;
     SearchStats stats = {0};
-    for (int depth = 1; depth < INT_MAX; depth++) {
+    int start = task->start_depth > 0 ? task->start_depth : 1;
+    for (int depth = start; depth < INT_MAX; depth++) {
         bool should_stop = task->control.stop;
         if (!should_stop && task->control.external_stop != NULL) {
             should_stop = *task->control.external_stop;
@@ -241,11 +243,12 @@ Move think(Board *board,
         }
     }
     for (int i = 0; i < num_workers; i++) {
-        worker_tasks[i].board   = *board;
-        worker_tasks[i].history = search_history;
-        worker_tasks[i].context = search_context;
-        worker_tasks[i].control = (SearchControl){0};
+        worker_tasks[i].board       = *board;
+        worker_tasks[i].history     = search_history;
+        worker_tasks[i].context     = search_context;
+        worker_tasks[i].control     = (SearchControl){0};
         worker_tasks[i].control.external_stop = &smp_stop;
+        worker_tasks[i].start_depth = 1 + (i % 3); /* stagger: depths 1, 2, 3, 1, 2, 3... */
         if (pthread_create(&worker_threads[i], NULL, smp_worker_main, &worker_tasks[i]) != 0) {
             num_workers = i;  /* shrink on failure, remaining slots unused */
             break;
