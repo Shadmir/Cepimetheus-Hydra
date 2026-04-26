@@ -122,42 +122,132 @@ static bool compute_clock_budget(const Board *board,
 }
 
 
+/* ---------- Persistent SMP thread pool ---------- */
+
 typedef struct {
-    Board board;
-    RepetitionHistory history;
-    SearchContext *context;           /* shared TT pointer — not owned */
-    SearchControl control;
-    unsigned long long total_nodes;   /* written by worker on exit, read by main after join */
-    int start_depth;                  /* staggered start to avoid redundant work */
-} SmpWorkerTask;
+    pthread_t       thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t  start_cond;   /* main  → worker: new search ready */
+    pthread_cond_t  done_cond;    /* worker → main:  search finished  */
+
+    /* Task data written by main before signalling start_cond */
+    Board              board;
+    RepetitionHistory  history;
+    SearchContext     *context;   /* shared TT, not owned */
+    SearchControl      control;
+    int                start_depth;
+    volatile bool     *smp_stop;  /* points into think()'s stack frame */
+
+    /* State flags (protected by mutex) */
+    bool should_search;
+    bool is_searching;
+    bool quit;
+
+    /* Output written by worker after each search */
+    unsigned long long total_nodes;
+} SmpWorker;
+
+struct SmpThreadPool {
+    SmpWorker *workers;
+    int        num_workers;
+};
 
 static void *smp_worker_main(void *arg) {
-    SmpWorkerTask *task = (SmpWorkerTask *)arg;
-    unsigned long long total_nodes = 0;
-    SearchStats stats = {0};
-    int start = task->start_depth > 0 ? task->start_depth : 1;
-    for (int depth = start; depth < INT_MAX; depth++) {
-        bool should_stop = task->control.stop;
-        if (!should_stop && task->control.external_stop != NULL) {
-            should_stop = *task->control.external_stop;
+    SmpWorker *w = (SmpWorker *)arg;
+
+    for (;;) {
+        pthread_mutex_lock(&w->mutex);
+        while (!w->should_search && !w->quit) {
+            pthread_cond_wait(&w->start_cond, &w->mutex);
         }
-        if (should_stop) break;
-        stats.seldepth = depth;
-        stats.nodes = 0;
-        search_root(&task->board, depth, &task->history, &stats,
-                    task->context, &task->control, NULL, NULL);
-        total_nodes += stats.nodes;
-        if (task->control.stop) break;
+        bool do_quit = w->quit;
+        w->is_searching = !do_quit;
+        pthread_mutex_unlock(&w->mutex);
+
+        if (do_quit) break;
+
+        unsigned long long total_nodes = 0;
+        SearchStats stats = {0};
+        int start = w->start_depth > 0 ? w->start_depth : 1;
+        for (int depth = start; depth < INT_MAX; depth++) {
+            bool should_stop = w->control.stop;
+            if (!should_stop && w->smp_stop != NULL) {
+                should_stop = *w->smp_stop;
+            }
+            if (should_stop) break;
+            stats.nodes = 0;
+            search_root(&w->board, depth, &w->history, &stats,
+                        w->context, &w->control, NULL, NULL);
+            total_nodes += stats.nodes;
+            if (w->control.stop) break;
+        }
+
+        pthread_mutex_lock(&w->mutex);
+        w->total_nodes   = total_nodes;
+        w->should_search = false;
+        w->is_searching  = false;
+        pthread_cond_signal(&w->done_cond);
+        pthread_mutex_unlock(&w->mutex);
     }
-    task->total_nodes = total_nodes;
     return NULL;
+}
+
+SmpThreadPool *smp_thread_pool_create(int num_workers) {
+    if (num_workers <= 0) {
+        SmpThreadPool *pool = calloc(1, sizeof(*pool));
+        return pool;
+    }
+
+    SmpThreadPool *pool = calloc(1, sizeof(*pool));
+    if (pool == NULL) return NULL;
+
+    pool->workers = calloc((size_t)num_workers, sizeof(SmpWorker));
+    if (pool->workers == NULL) {
+        free(pool);
+        return NULL;
+    }
+    pool->num_workers = num_workers;
+
+    for (int i = 0; i < num_workers; i++) {
+        SmpWorker *w = &pool->workers[i];
+        pthread_mutex_init(&w->mutex, NULL);
+        pthread_cond_init(&w->start_cond, NULL);
+        pthread_cond_init(&w->done_cond, NULL);
+        if (pthread_create(&w->thread, NULL, smp_worker_main, w) != 0) {
+            /* Shrink pool to successfully-started workers */
+            pool->num_workers = i;
+            break;
+        }
+    }
+
+    return pool;
+}
+
+void smp_thread_pool_destroy(SmpThreadPool *pool) {
+    if (pool == NULL) return;
+
+    for (int i = 0; i < pool->num_workers; i++) {
+        SmpWorker *w = &pool->workers[i];
+        pthread_mutex_lock(&w->mutex);
+        w->quit = true;
+        pthread_cond_signal(&w->start_cond);
+        pthread_mutex_unlock(&w->mutex);
+        pthread_join(w->thread, NULL);
+        pthread_mutex_destroy(&w->mutex);
+        pthread_cond_destroy(&w->start_cond);
+        pthread_cond_destroy(&w->done_cond);
+    }
+
+    free(pool->workers);
+    free(pool);
 }
 
 Move think(Board *board,
            const SearchLimits *limits,
            const SearchOptions *options,
            const RepetitionHistory *history,
-           volatile bool *stop_signal) {
+           volatile bool *stop_signal,
+           SmpThreadPool *pool) {
     if (board == NULL) {
         return MOVE_NONE;
     }
@@ -224,35 +314,23 @@ Move think(Board *board,
 
     SearchContext *search_context = search_context_create();
 
-    /* Lazy SMP: spawn N-1 helper threads sharing the same TT */
-    int num_threads = (options != NULL && options->threads > 0) ? options->threads : 1;
-    int num_workers = num_threads - 1;
+    /* Lazy SMP: signal persistent worker threads to start searching */
     volatile bool smp_stop = false;
-    pthread_t *worker_threads = NULL;
-    SmpWorkerTask *worker_tasks = NULL;
+    int num_workers = (pool != NULL) ? pool->num_workers : 0;
 
-    if (num_workers > 0) {
-        worker_threads = calloc((size_t)num_workers, sizeof(pthread_t));
-        worker_tasks   = calloc((size_t)num_workers, sizeof(SmpWorkerTask));
-        if (worker_threads == NULL || worker_tasks == NULL) {
-            free(worker_threads);
-            free(worker_tasks);
-            worker_threads = NULL;
-            worker_tasks   = NULL;
-            num_workers    = 0;
-        }
-    }
     for (int i = 0; i < num_workers; i++) {
-        worker_tasks[i].board       = *board;
-        worker_tasks[i].history     = search_history;
-        worker_tasks[i].context     = search_context;
-        worker_tasks[i].control     = (SearchControl){0};
-        worker_tasks[i].control.external_stop = &smp_stop;
-        worker_tasks[i].start_depth = 1 + (i % 3); /* stagger: depths 1, 2, 3, 1, 2, 3... */
-        if (pthread_create(&worker_threads[i], NULL, smp_worker_main, &worker_tasks[i]) != 0) {
-            num_workers = i;  /* shrink on failure, remaining slots unused */
-            break;
-        }
+        SmpWorker *w = &pool->workers[i];
+        pthread_mutex_lock(&w->mutex);
+        w->board       = *board;
+        w->history     = search_history;
+        w->context     = search_context;
+        w->control     = (SearchControl){0};
+        w->smp_stop    = &smp_stop;
+        w->start_depth = 1 + (i % 3); /* stagger: depths 1, 2, 3, 1, 2, 3... */
+        w->total_nodes = 0;
+        w->should_search = true;
+        pthread_cond_signal(&w->start_cond);
+        pthread_mutex_unlock(&w->mutex);
     }
 
     SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0, false};
@@ -324,15 +402,18 @@ Move think(Board *board,
         }
     }
 
-    /* Signal workers to stop and wait for them before destroying shared context */
+    /* Signal workers to stop and wait for them to finish before destroying shared context */
     smp_stop = true;
     unsigned long long worker_nodes = 0;
     for (int i = 0; i < num_workers; i++) {
-        pthread_join(worker_threads[i], NULL);
-        worker_nodes += worker_tasks[i].total_nodes;
+        SmpWorker *w = &pool->workers[i];
+        pthread_mutex_lock(&w->mutex);
+        while (w->is_searching) {
+            pthread_cond_wait(&w->done_cond, &w->mutex);
+        }
+        worker_nodes += w->total_nodes;
+        pthread_mutex_unlock(&w->mutex);
     }
-    free(worker_threads);
-    free(worker_tasks);
 
     /* Print worker thread totals so multi-thread search depth is visible */
     if (worker_nodes > 0) {

@@ -20,10 +20,17 @@ typedef struct SearchLimits {
     bool infinite;
 } SearchLimits;
 
+/* Persistent SMP worker thread pool — create once, reuse across moves. */
+typedef struct SmpThreadPool SmpThreadPool;
+
+SmpThreadPool *smp_thread_pool_create(int num_workers);
+void           smp_thread_pool_destroy(SmpThreadPool *pool);
+
 Move think(Board *board,
            const SearchLimits *limits,
            const SearchOptions *options,
            const RepetitionHistory *history,
-           volatile bool *stop_signal);
+           volatile bool *stop_signal,
+           SmpThreadPool *pool);
 
 #endif

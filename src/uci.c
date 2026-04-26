@@ -82,6 +82,7 @@ typedef struct {
     RepetitionHistory history;
     SearchLimits limits;
     SearchOptions options;
+    SmpThreadPool *pool;
     volatile bool *stop_requested;
     bool *searching;
     pthread_mutex_t *mutex;
@@ -157,7 +158,8 @@ static void *search_thread_main(void *arg) {
                       &task->limits,
                       &task->options,
                       &task->history,
-                      task->stop_requested);
+                      task->stop_requested,
+                      task->pool);
     print_bestmove(best);
 
     pthread_mutex_lock(task->mutex);
@@ -207,7 +209,8 @@ static bool search_thread_start(SearchThreadState *state,
                                 const Board *board,
                                 const RepetitionHistory *history,
                                 const SearchLimits *limits,
-                                const SearchOptions *options) {
+                                const SearchOptions *options,
+                                SmpThreadPool *pool) {
     SearchTask *task = calloc(1, sizeof(*task));
     if (task == NULL) {
         return false;
@@ -217,6 +220,7 @@ static bool search_thread_start(SearchThreadState *state,
     task->history = *history;
     task->limits = *limits;
     task->options = *options;
+    task->pool = pool;
     task->stop_requested = &state->stop_requested;
     task->searching = &state->searching;
     task->mutex = &state->mutex;
@@ -248,6 +252,9 @@ void uci_loop(void) {
     options.overhead_ms = 100;
     options.threads = 1;
 
+    SmpThreadPool *thread_pool = smp_thread_pool_create(0); /* 0 workers until Threads is set */
+    int pool_threads = 1; /* tracks options.threads so we know when to recreate the pool */
+
     SearchThreadState search_thread = {0};
     pthread_mutex_init(&search_thread.mutex, NULL);
 
@@ -256,7 +263,7 @@ void uci_loop(void) {
         search_thread_join_if_finished(&search_thread);
 
         if (strncmp(line, "uci", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t' || line[3] == '\r' || line[3] == '\n')) {
-            printf("id name Cepimetheus\n");
+            printf("id name Cepimetheus-Hydra\n");
             printf("id author David Vaughan & George Bland\n");
             printf("option name overhead type spin default 100 min 0 max 10000\n");
             printf("option name Threads type spin default 1 min 1 max 256\n");
@@ -292,6 +299,12 @@ void uci_loop(void) {
                     int parsed_threads = atoi(valuetoken);
                     if (parsed_threads >= 1 && parsed_threads <= 256) {
                         options.threads = parsed_threads;
+                        if (parsed_threads != pool_threads) {
+                            search_thread_stop_and_join(&search_thread);
+                            smp_thread_pool_destroy(thread_pool);
+                            thread_pool = smp_thread_pool_create(parsed_threads - 1);
+                            pool_threads = parsed_threads;
+                        }
                     }
                 }
             }
@@ -318,7 +331,7 @@ void uci_loop(void) {
 
             SearchLimits limits;
             parse_go_limits(&limits, line);
-            if (!search_thread_start(&search_thread, &board, &history, &limits, &options)) {
+            if (!search_thread_start(&search_thread, &board, &history, &limits, &options, thread_pool)) {
                 print_bestmove(MOVE_NONE);
             }
             continue;
@@ -338,4 +351,5 @@ void uci_loop(void) {
     search_thread_stop_and_join(&search_thread);
     search_thread_join_if_finished(&search_thread);
     pthread_mutex_destroy(&search_thread.mutex);
+    smp_thread_pool_destroy(thread_pool);
 }
