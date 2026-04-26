@@ -125,12 +125,14 @@ static bool compute_clock_budget(const Board *board,
 typedef struct {
     Board board;
     RepetitionHistory history;
-    SearchContext *context;      /* shared TT pointer — not owned */
+    SearchContext *context;           /* shared TT pointer — not owned */
     SearchControl control;
+    unsigned long long total_nodes;   /* written by worker on exit, read by main after join */
 } SmpWorkerTask;
 
 static void *smp_worker_main(void *arg) {
     SmpWorkerTask *task = (SmpWorkerTask *)arg;
+    unsigned long long total_nodes = 0;
     SearchStats stats = {0};
     for (int depth = 1; depth < INT_MAX; depth++) {
         bool should_stop = task->control.stop;
@@ -142,8 +144,10 @@ static void *smp_worker_main(void *arg) {
         stats.nodes = 0;
         search_root(&task->board, depth, &task->history, &stats,
                     task->context, &task->control, NULL, NULL);
+        total_nodes += stats.nodes;
         if (task->control.stop) break;
     }
+    task->total_nodes = total_nodes;
     return NULL;
 }
 
@@ -319,11 +323,23 @@ Move think(Board *board,
 
     /* Signal workers to stop and wait for them before destroying shared context */
     smp_stop = true;
+    unsigned long long worker_nodes = 0;
     for (int i = 0; i < num_workers; i++) {
         pthread_join(worker_threads[i], NULL);
+        worker_nodes += worker_tasks[i].total_nodes;
     }
     free(worker_threads);
     free(worker_tasks);
+
+    /* Print worker thread totals so multi-thread search depth is visible */
+    if (worker_nodes > 0) {
+        long long elapsed_ms = current_time_ms() - start_time_ms;
+        if (elapsed_ms < 0) elapsed_ms = 0;
+        unsigned long long total_nps = elapsed_ms > 0
+            ? (worker_nodes * 1000ULL) / (unsigned long long)elapsed_ms : 0;
+        printf("info string worker_nodes %llu nps %llu\n", worker_nodes, total_nps);
+        fflush(stdout);
+    }
 
     if (best_result.move == MOVE_NONE) {
         search_context_destroy(search_context);

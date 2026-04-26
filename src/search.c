@@ -16,18 +16,15 @@ typedef struct {
     int score;
 } ScoredMove;
 
-typedef struct {
-    Move move;
-    float score;
-    bool searched;
-} RankedMove;
+typedef enum { TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2 } TTBound;
 
 typedef struct {
     bool valid;
     U64 hash;
+    float score;
+    Move best_move;
     int depth;
-    int move_count;
-    Move moves[MAX_ORDERED_MOVES];
+    TTBound bound;
 } TranspositionEntry;
 
 typedef struct {
@@ -131,20 +128,6 @@ static int compare_scored_moves(const void *a, const void *b) {
     return move_b->score - move_a->score;
 }
 
-static int compare_ranked_moves(const void *a, const void *b) {
-    const RankedMove *move_a = (const RankedMove *)a;
-    const RankedMove *move_b = (const RankedMove *)b;
-
-    if (move_a->score < move_b->score) {
-        return 1;
-    }
-
-    if (move_a->score > move_b->score) {
-        return -1;
-    }
-
-    return 0;
-}
 
 static size_t transposition_table_index(const TranspositionTable *table, U64 hash) {
     return (size_t)(hash & (table->size - 1U));
@@ -166,134 +149,51 @@ static const TranspositionEntry *transposition_table_lookup(const TranspositionT
 /* NOTE: Called concurrently by Lazy SMP worker threads without locking.
  * A partial write causes a hash mismatch on lookup, which is treated as a
  * cache miss — safe. This benign data race is intentional (standard practice). */
-static void transposition_table_store(TranspositionTable *table, U64 hash, int depth, const Move *moves, int move_count) {
-    if (table == NULL || table->entries == NULL || table->size == 0 || moves == NULL || move_count <= 0) {
+static void transposition_table_store(TranspositionTable *table, U64 hash, int depth,
+                                      float score, TTBound bound, Move best_move) {
+    if (table == NULL || table->entries == NULL || table->size == 0) {
         return;
-    }
-
-    if (move_count > MAX_ORDERED_MOVES) {
-        move_count = MAX_ORDERED_MOVES;
     }
 
     TranspositionEntry *entry = &table->entries[transposition_table_index(table, hash)];
-    if (entry->valid && entry->hash == hash && depth <= entry->depth) {
+    if (entry->valid && depth < entry->depth) {
         return;
     }
 
-    if (entry->valid && entry->hash != hash && depth <= entry->depth) {
-        return;
-    }
-
-    entry->valid = true;
-    entry->hash = hash;
-    entry->depth = depth;
-    entry->move_count = move_count;
-    memcpy(entry->moves, moves, (size_t)move_count * sizeof(Move));
-}
-
-static int find_move_index(const MoveList *list, Move move) {
-    if (list == NULL) {
-        return -1;
-    }
-
-    for (int i = 0; i < list->count; ++i) {
-        if (list->moves[i] == move) {
-            return i;
-        }
-    }
-
-    return -1;
+    entry->valid     = true;
+    entry->hash      = hash;
+    entry->depth     = depth;
+    entry->score     = score;
+    entry->bound     = bound;
+    entry->best_move = best_move;
 }
 
 static int build_ordered_moves(Board *board,
                                const MoveList *list,
-                               const TranspositionTable *table,
+                               Move tt_move,
                                Move ordered_moves[MAX_ORDERED_MOVES]) {
     if (board == NULL || list == NULL || ordered_moves == NULL || list->count <= 0) {
         return 0;
     }
 
-    U64 hash = board_position_key(board);
-    const TranspositionEntry *entry = transposition_table_lookup(table, hash);
-
-    if (entry == NULL) {
-        ScoredMove scored_moves[MAX_ORDERED_MOVES];
-        int scored_count = 0;
-        for (int i = 0; i < list->count && i < MAX_ORDERED_MOVES; ++i) {
-            scored_moves[scored_count].move = list->moves[i];
-            scored_moves[scored_count].score = estimate_move_score(board, list->moves[i]);
-            ++scored_count;
+    ScoredMove scored_moves[MAX_ORDERED_MOVES];
+    int count = 0;
+    for (int i = 0; i < list->count && i < MAX_ORDERED_MOVES; ++i) {
+        scored_moves[count].move  = list->moves[i];
+        scored_moves[count].score = estimate_move_score(board, list->moves[i]);
+        if (list->moves[i] == tt_move) {
+            scored_moves[count].score += 2000000;  /* TT best move goes first */
         }
-
-        qsort(scored_moves, (size_t)scored_count, sizeof(ScoredMove), compare_scored_moves);
-        for (int i = 0; i < scored_count; ++i) {
-            ordered_moves[i] = scored_moves[i].move;
-        }
-
-        return scored_count;
+        ++count;
     }
 
-    bool used[MAX_ORDERED_MOVES] = {false};
-    int ordered_count = 0;
-
-    for (int i = 0; i < entry->move_count && ordered_count < list->count; ++i) {
-        Move move = entry->moves[i];
-        int index = find_move_index(list, move);
-        if (index >= 0 && !used[index]) {
-            ordered_moves[ordered_count++] = move;
-            used[index] = true;
-        }
+    qsort(scored_moves, (size_t)count, sizeof(ScoredMove), compare_scored_moves);
+    for (int i = 0; i < count; ++i) {
+        ordered_moves[i] = scored_moves[i].move;
     }
-
-    ScoredMove fallback_moves[MAX_ORDERED_MOVES];
-    int fallback_count = 0;
-    for (int i = 0; i < list->count && fallback_count < MAX_ORDERED_MOVES; ++i) {
-        if (used[i]) {
-            continue;
-        }
-
-        fallback_moves[fallback_count].move = list->moves[i];
-        fallback_moves[fallback_count].score = estimate_move_score(board, list->moves[i]);
-        ++fallback_count;
-    }
-
-    qsort(fallback_moves, (size_t)fallback_count, sizeof(ScoredMove), compare_scored_moves);
-    for (int i = 0; i < fallback_count && ordered_count < MAX_ORDERED_MOVES; ++i) {
-        ordered_moves[ordered_count++] = fallback_moves[i].move;
-    }
-
-    return ordered_count;
+    return count;
 }
 
-static int finalize_move_order(const RankedMove *ranked_moves, int move_count, Move final_order[MAX_ORDERED_MOVES]) {
-    if (ranked_moves == NULL || final_order == NULL || move_count <= 0) {
-        return 0;
-    }
-
-    RankedMove searched_moves[MAX_ORDERED_MOVES];
-    int searched_count = 0;
-
-    for (int i = 0; i < move_count && i < MAX_ORDERED_MOVES; ++i) {
-        if (ranked_moves[i].searched) {
-            searched_moves[searched_count++] = ranked_moves[i];
-        }
-    }
-
-    qsort(searched_moves, (size_t)searched_count, sizeof(RankedMove), compare_ranked_moves);
-
-    int final_count = 0;
-    for (int i = 0; i < searched_count && final_count < MAX_ORDERED_MOVES; ++i) {
-        final_order[final_count++] = searched_moves[i].move;
-    }
-
-    for (int i = 0; i < move_count && final_count < MAX_ORDERED_MOVES; ++i) {
-        if (!ranked_moves[i].searched) {
-            final_order[final_count++] = ranked_moves[i].move;
-        }
-    }
-
-    return final_count;
-}
 
 /* Quiescence search: only explores captures and checks. */
 static float quiescence(Board *board,
@@ -317,6 +217,20 @@ static float quiescence(Board *board,
         return 0.0f;
     }
 
+    float orig_alpha = alpha;
+    U64 hash = board_position_key(board);
+    Move tt_move = MOVE_NONE;
+
+    const TranspositionEntry *tt = transposition_table_lookup(table, hash);
+    if (tt != NULL) {
+        tt_move = tt->best_move;
+        if (tt->depth >= 0) {
+            if (tt->bound == TT_EXACT) return tt->score;
+            if (tt->bound == TT_LOWER && tt->score >= beta)  return tt->score;
+            if (tt->bound == TT_UPPER && tt->score <= alpha) return tt->score;
+        }
+    }
+
     /* Stand-pat: evaluate current position. */
     float stand_pat = evaluate_position(board, history, ply);
 
@@ -332,20 +246,16 @@ static float quiescence(Board *board,
     movegen_generate_legal(board, &list);
 
     Move ordered_moves[MAX_ORDERED_MOVES];
-    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
+    int ordered_count = build_ordered_moves(board, &list, tt_move, ordered_moves);
 
-    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
-    for (int i = 0; i < ordered_count; ++i) {
-        ranked_moves[i].move = ordered_moves[i];
-        ranked_moves[i].searched = false;
-    }
+    Move best_q_move = MOVE_NONE;
 
     for (int i = 0; i < ordered_count; ++i) {
         if (search_should_stop(control)) {
             break;
         }
 
-        Move move = ranked_moves[i].move;
+        Move move = ordered_moves[i];
         if (!move_iscapture(board, move) && !move_ischeck(board, move)) {
             continue;
         }
@@ -364,26 +274,25 @@ static float quiescence(Board *board,
 
         float score = -quiescence(board, -beta, -alpha, history, stats, ply + 1, table, control);
 
-        ranked_moves[i].score = score;
-        ranked_moves[i].searched = true;
-
         --history->count;
-
         board_unmake_move(board, &undo);
 
         if (score >= beta) {
+            if (control == NULL || !control->stop) {
+                transposition_table_store(table, hash, 0, score, TT_LOWER, move);
+            }
             return beta;
         }
 
         if (score > alpha) {
             alpha = score;
+            best_q_move = move;
         }
     }
 
-    Move final_order[MAX_ORDERED_MOVES];
-    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
-    if (final_count > 0) {
-        transposition_table_store(table, board_position_key(board), 0, final_order, final_count);
+    if (control == NULL || !control->stop) {
+        TTBound bound = (alpha <= orig_alpha) ? TT_UPPER : TT_EXACT;
+        transposition_table_store(table, hash, 0, alpha, bound, best_q_move);
     }
 
     return alpha;
@@ -411,6 +320,30 @@ static SearchResult negamax(Board *board,
     if (board_is_draw(board, history)) {
         result.score = 0.0f;
         return result;
+    }
+
+    float orig_alpha = alpha;
+    U64 hash = board_position_key(board);
+    Move tt_move = MOVE_NONE;
+
+    const TranspositionEntry *tt = transposition_table_lookup(table, hash);
+    if (tt != NULL) {
+        tt_move = tt->best_move;
+        if (tt->depth >= depth) {
+            if (tt->bound == TT_EXACT) {
+                result.score = tt->score;
+                result.move  = tt->best_move;
+                return result;
+            }
+            if (tt->bound == TT_LOWER && tt->score >= beta) {
+                result.score = tt->score;
+                return result;
+            }
+            if (tt->bound == TT_UPPER && tt->score <= alpha) {
+                result.score = tt->score;
+                return result;
+            }
+        }
     }
 
     /* Null-move pruning, avoided in endgames to avoid zugzwang issues. */
@@ -462,13 +395,7 @@ static SearchResult negamax(Board *board,
     }
 
     Move ordered_moves[MAX_ORDERED_MOVES];
-    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
-
-    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
-    for (int i = 0; i < ordered_count; ++i) {
-        ranked_moves[i].move = ordered_moves[i];
-        ranked_moves[i].searched = false;
-    }
+    int ordered_count = build_ordered_moves(board, &list, tt_move, ordered_moves);
 
     for (int i = 0; i < ordered_count; ++i) {
         if (search_should_stop(control)) {
@@ -491,16 +418,12 @@ static SearchResult negamax(Board *board,
         SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, ply + 1, table, control);
         float score = -child.score;
 
-        ranked_moves[i].score = score;
-        ranked_moves[i].searched = true;
-
         --history->count;
-
         board_unmake_move(board, &undo);
 
         if (score > result.score || result.move == MOVE_NONE) {
             result.score = score;
-            result.move = move;
+            result.move  = move;
             result.pv[0] = move;
             result.pv_length = 1;
             for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
@@ -517,10 +440,12 @@ static SearchResult negamax(Board *board,
         }
     }
 
-    Move final_order[MAX_ORDERED_MOVES];
-    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
-    if (final_count > 0) {
-        transposition_table_store(table, board_position_key(board), depth, final_order, final_count);
+    if (control == NULL || !control->stop) {
+        TTBound bound;
+        if (result.score <= orig_alpha)  bound = TT_UPPER;
+        else if (result.score >= beta)   bound = TT_LOWER;
+        else                             bound = TT_EXACT;
+        transposition_table_store(table, hash, depth, result.score, bound, result.move);
     }
 
     return result;
@@ -589,14 +514,15 @@ SearchResult search_root(Board *board,
         return result;
     }
 
-    Move ordered_moves[MAX_ORDERED_MOVES];
-    int ordered_count = build_ordered_moves(board, &list, table, ordered_moves);
-
-    RankedMove ranked_moves[MAX_ORDERED_MOVES] = {0};
-    for (int i = 0; i < ordered_count; ++i) {
-        ranked_moves[i].move = ordered_moves[i];
-        ranked_moves[i].searched = false;
+    U64 hash = board_position_key(board);
+    Move tt_move = MOVE_NONE;
+    const TranspositionEntry *tt = transposition_table_lookup(table, hash);
+    if (tt != NULL) {
+        tt_move = tt->best_move;
     }
+
+    Move ordered_moves[MAX_ORDERED_MOVES];
+    int ordered_count = build_ordered_moves(board, &list, tt_move, ordered_moves);
 
     for (int i = 0; i < ordered_count; ++i) {
         if (search_should_stop(control)) {
@@ -619,11 +545,7 @@ SearchResult search_root(Board *board,
         SearchResult child = negamax(board, depth - 1, -beta, -alpha, history, stats, 1, table, control);
         float score = -child.score;
 
-        ranked_moves[i].score = score;
-        ranked_moves[i].searched = true;
-
         --history->count;
-
         board_unmake_move(board, &undo);
 
         if (on_move_info != NULL) {
@@ -632,7 +554,7 @@ SearchResult search_root(Board *board,
 
         if (score > result.score || result.move == MOVE_NONE) {
             result.score = score;
-            result.move = move;
+            result.move  = move;
             result.pv[0] = move;
             result.pv_length = 1;
             for (int j = 0; j < child.pv_length && result.pv_length < MAX_PV_MOVES; ++j) {
@@ -649,10 +571,8 @@ SearchResult search_root(Board *board,
         }
     }
 
-    Move final_order[MAX_ORDERED_MOVES];
-    int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
-    if (final_count > 0) {
-        transposition_table_store(table, board_position_key(board), depth, final_order, final_count);
+    if ((control == NULL || !control->stop) && result.move != MOVE_NONE) {
+        transposition_table_store(table, hash, depth, result.score, TT_EXACT, result.move);
     }
 
     return result;
