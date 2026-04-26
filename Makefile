@@ -1,5 +1,6 @@
 CC ?= cc
-CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Wpedantic -Iinclude
+THREAD_FLAGS ?= -pthread
+CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Wpedantic -Iinclude $(THREAD_FLAGS)
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN32_CC ?= i686-w64-mingw32-gcc
 
@@ -17,7 +18,7 @@ SRC := \
 
 OBJ := $(SRC:.c=.o)
 
-.PHONY: all clean run windows windows32
+.PHONY: all clean run windows
 
 all: $(TARGET)
 
@@ -29,7 +30,7 @@ run: $(TARGET)
 
 windows:
 	$(MAKE) clean
-	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus.exe
+	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus.exe THREAD_FLAGS='-pthread -static -static-libgcc'
 
 
 clean:

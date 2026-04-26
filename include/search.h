@@ -22,6 +22,7 @@ typedef struct {
     bool hard_time_limited;
     long long hard_stop_time_ms;
     bool stop;
+    volatile bool *external_stop;
 } SearchControl;
 
 typedef struct SearchContext SearchContext;

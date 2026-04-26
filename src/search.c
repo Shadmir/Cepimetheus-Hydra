@@ -28,15 +28,15 @@ typedef struct {
     int depth;
     int move_count;
     Move moves[MAX_ORDERED_MOVES];
-} TransitionEntry;
+} TranspositionEntry;
 
 typedef struct {
-    TransitionEntry *entries;
+    TranspositionEntry *entries;
     size_t size;
-} TransitionTable;
+} TranspositionTable;
 
 struct SearchContext {
-    TransitionTable table;
+    TranspositionTable table;
 };
 
 static const int piece_values[6] = {
@@ -60,6 +60,11 @@ static long long current_time_ms(void) {
 static bool search_should_stop(SearchControl *control) {
     if (control == NULL) {
         return false;
+    }
+
+    if (control->external_stop != NULL && *control->external_stop) {
+        control->stop = true;
+        return true;
     }
 
     if (control->stop) {
@@ -141,16 +146,16 @@ static int compare_ranked_moves(const void *a, const void *b) {
     return 0;
 }
 
-static size_t transition_table_index(const TransitionTable *table, U64 hash) {
+static size_t transposition_table_index(const TranspositionTable *table, U64 hash) {
     return (size_t)(hash & (table->size - 1U));
 }
 
-static const TransitionEntry *transition_table_lookup(const TransitionTable *table, U64 hash) {
+static const TranspositionEntry *transposition_table_lookup(const TranspositionTable *table, U64 hash) {
     if (table == NULL || table->entries == NULL || table->size == 0) {
         return NULL;
     }
 
-    const TransitionEntry *entry = &table->entries[transition_table_index(table, hash)];
+    const TranspositionEntry *entry = &table->entries[transposition_table_index(table, hash)];
     if (!entry->valid || entry->hash != hash) {
         return NULL;
     }
@@ -158,7 +163,7 @@ static const TransitionEntry *transition_table_lookup(const TransitionTable *tab
     return entry;
 }
 
-static void transition_table_store(TransitionTable *table, U64 hash, int depth, const Move *moves, int move_count) {
+static void transposition_table_store(TranspositionTable *table, U64 hash, int depth, const Move *moves, int move_count) {
     if (table == NULL || table->entries == NULL || table->size == 0 || moves == NULL || move_count <= 0) {
         return;
     }
@@ -167,7 +172,7 @@ static void transition_table_store(TransitionTable *table, U64 hash, int depth, 
         move_count = MAX_ORDERED_MOVES;
     }
 
-    TransitionEntry *entry = &table->entries[transition_table_index(table, hash)];
+    TranspositionEntry *entry = &table->entries[transposition_table_index(table, hash)];
     if (entry->valid && entry->hash == hash && depth <= entry->depth) {
         return;
     }
@@ -199,14 +204,14 @@ static int find_move_index(const MoveList *list, Move move) {
 
 static int build_ordered_moves(Board *board,
                                const MoveList *list,
-                               const TransitionTable *table,
+                               const TranspositionTable *table,
                                Move ordered_moves[MAX_ORDERED_MOVES]) {
     if (board == NULL || list == NULL || ordered_moves == NULL || list->count <= 0) {
         return 0;
     }
 
     U64 hash = board_position_key(board);
-    const TransitionEntry *entry = transition_table_lookup(table, hash);
+    const TranspositionEntry *entry = transposition_table_lookup(table, hash);
 
     if (entry == NULL) {
         ScoredMove scored_moves[MAX_ORDERED_MOVES];
@@ -294,7 +299,7 @@ static float quiescence(Board *board,
                         RepetitionHistory *history,
                         SearchStats *stats,
                         int ply,
-                        TransitionTable *table,
+                        TranspositionTable *table,
                         SearchControl *control) {
     if (search_should_stop(control)) {
         return evaluate_position(board, history, ply);
@@ -375,7 +380,7 @@ static float quiescence(Board *board,
     Move final_order[MAX_ORDERED_MOVES];
     int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
     if (final_count > 0) {
-        transition_table_store(table, board_position_key(board), 0, final_order, final_count);
+        transposition_table_store(table, board_position_key(board), 0, final_order, final_count);
     }
 
     return alpha;
@@ -389,7 +394,7 @@ static SearchResult negamax(Board *board,
                             RepetitionHistory *history,
                             SearchStats *stats,
                             int ply,
-                            TransitionTable *table,
+                            TranspositionTable *table,
                             SearchControl *control) {
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
@@ -512,7 +517,7 @@ static SearchResult negamax(Board *board,
     Move final_order[MAX_ORDERED_MOVES];
     int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
     if (final_count > 0) {
-        transition_table_store(table, board_position_key(board), depth, final_order, final_count);
+        transposition_table_store(table, board_position_key(board), depth, final_order, final_count);
     }
 
     return result;
@@ -550,7 +555,7 @@ SearchResult search_root(Board *board,
     float alpha = -FLT_MAX;
     float beta = FLT_MAX;
 
-    TransitionTable *table = NULL;
+    TranspositionTable *table = NULL;
     if (context != NULL && context->table.entries != NULL) {
         table = &context->table;
     }
@@ -644,7 +649,7 @@ SearchResult search_root(Board *board,
     Move final_order[MAX_ORDERED_MOVES];
     int final_count = finalize_move_order(ranked_moves, ordered_count, final_order);
     if (final_count > 0) {
-        transition_table_store(table, board_position_key(board), depth, final_order, final_count);
+        transposition_table_store(table, board_position_key(board), depth, final_order, final_count);
     }
 
     return result;

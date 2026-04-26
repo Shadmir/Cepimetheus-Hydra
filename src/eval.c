@@ -314,6 +314,8 @@ float evaluate_position(Board *board, const RepetitionHistory *history, int ply)
 
     int side_to_move = board->side;
 
+    /* Determine if the position is an endgame.
+    Endgame eval is different from opening/middlegame eval, so we need to know which phase we're in. */
     int endgame = eval_is_endgame_position(board) ? 1 : -1;
 
     int white_pawns_per_file[8];
@@ -350,20 +352,23 @@ float evaluate_position(Board *board, const RepetitionHistory *history, int ply)
             }
         }
     }
-
-    /* Centre control. */
-    static const int center_squares[4] = {27, 28, 35, 36}; /* d4, e4, d5, e5 */
-    for (int i = 0; i < 4; ++i) {
-        int square = center_squares[i];
-        white_score += 3.0f * (float)count_attackers_on_square(board, square, WHITE);
-        black_score += 3.0f * (float)count_attackers_on_square(board, square, BLACK);
-    }
+    float tempo_bonus = 0.0f;
+    if(endgame == -1) {
+        
+        /* Unless the position is zugzwang, having a move is often better. */
+        tempo_bonus = 20.0f;
+        /* Centre control. not a big deal in endgames */
+        static const int center_squares[4] = {27, 28, 35, 36}; /* d4, e4, d5, e5 */
+        for (int i = 0; i < 4; ++i) {
+            int square = center_squares[i];
+            white_score += 3.0f * (float)count_attackers_on_square(board, square, WHITE);
+            black_score += 3.0f * (float)count_attackers_on_square(board, square, BLACK);
+        }
+    }    
 
     white_score -= 2.0f * (float)count_king_ring_attackers(board, WHITE);
     black_score -= 2.0f * (float)count_king_ring_attackers(board, BLACK);
 
-    /* Unless the position is zugzwang, having a move is often better. */
-    float tempo_bonus = (endgame == -1) ? 10.0f : 0.0f;
 
     if (side_to_move == WHITE) {
         return white_score - black_score + tempo_bonus;

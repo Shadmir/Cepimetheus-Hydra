@@ -1,6 +1,7 @@
 #include "think.h"
-#include "search.h"
+#include "../include/search.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -120,7 +121,11 @@ static bool compute_clock_budget(const Board *board,
 }
 
 
-Move think(Board *board, const SearchLimits *limits, const SearchOptions *options, const RepetitionHistory *history) {
+Move think(Board *board,
+           const SearchLimits *limits,
+           const SearchOptions *options,
+           const RepetitionHistory *history,
+           volatile bool *stop_signal) {
     if (board == NULL) {
         return MOVE_NONE;
     }
@@ -132,6 +137,7 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
     int overhead_ms = 50;
     bool depth_explicitly_set = false;
     bool time_limited = false;
+    bool infinite_search = false;
     const int max_iterative_depth = 64;
 
     if (options != NULL) {
@@ -147,6 +153,10 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
             movetime_ms = limits->movetime_ms;
         } else if (limits->has_clock_time && compute_clock_budget(board, limits, options, &soft_time_limit_ms, &hard_time_limit_ms)) {
             time_limited = true;
+        }
+
+        if (limits->infinite) {
+            infinite_search = true;
         }
     }
 
@@ -174,6 +184,7 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
     long long start_time_ms = current_time_ms();
 
     SearchControl control = {0};
+    control.external_stop = stop_signal;
     if (time_limited) {
         control.hard_time_limited = true;
         control.hard_stop_time_ms = start_time_ms + (long long)hard_time_limit_ms;
@@ -185,7 +196,16 @@ Move think(Board *board, const SearchLimits *limits, const SearchOptions *option
     SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
     /* Iterative deepening: search depths 1 through target_depth. */
-    for (int depth = 1; depth <= target_depth; ++depth) {
+    int depth_limit = target_depth;
+    if (infinite_search && !depth_explicitly_set && !time_limited && movetime_ms <= 0) {
+        depth_limit = INT_MAX;
+    }
+
+    for (int depth = 1; depth <= depth_limit; ++depth) {
+        if (stop_signal != NULL && *stop_signal) {
+            break;
+        }
+
         if (time_limited) {
             long long elapsed_before_depth_ms = current_time_ms() - start_time_ms;
             if (elapsed_before_depth_ms < 0) {
