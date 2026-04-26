@@ -4,7 +4,7 @@ CFLAGS ?= -std=c99 -O2 -Wall -Wextra -Wpedantic -Iinclude $(THREAD_FLAGS)
 WIN_CC ?= x86_64-w64-mingw32-gcc
 WIN32_CC ?= i686-w64-mingw32-gcc
 
-TARGET := Cepimetheus
+TARGET := Cepimetheus-Hydra
 SRC := \
 	src/main.c \
 	src/uci.c \
@@ -30,8 +30,8 @@ run: $(TARGET)
 
 windows:
 	$(MAKE) clean
-	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus.exe THREAD_FLAGS='-pthread -static -static-libgcc'
+	$(MAKE) CC=$(WIN_CC) TARGET=Cepimetheus-Hydra.exe THREAD_FLAGS='-pthread -static -static-libgcc'
 
 
 clean:
-	rm -f $(OBJ) $(TARGET) Cepimetheus.exe
+	rm -f $(OBJ) $(TARGET) Cepimetheus-Hydra.exe

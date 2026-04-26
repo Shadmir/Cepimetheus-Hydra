@@ -27,7 +27,7 @@ make windows
 Start the engine binary and speak UCI over stdin/stdout:
 
 ```sh
-./Cepimetheus
+./Cepimetheus-Hydra
 ```
 
 ## UCI Options
@@ -66,8 +66,8 @@ To run a match between single-threaded and 4-thread versions:
 
 ```sh
 cutechess-cli \
-  -engine name=Cep1T cmd=./Cepimetheus option.Threads=1 \
-  -engine name=Cep4T cmd=./Cepimetheus option.Threads=4 \
+  -engine name=Cep1T cmd=./Cepimetheus-Hydra option.Threads=1 \
+  -engine name=Cep4T cmd=./Cepimetheus-Hydra option.Threads=4 \
   -each proto=uci tc=10+0.1 \
   -games 400 -concurrency 2 -repeat \
   -pgnout results.pgn
