@@ -32,15 +32,23 @@ Start the engine binary and speak UCI over stdin/stdout:
 
 ## UCI Options
 
+### `Hash` (default: 64, range: 1–65536)
+
+Size of the transposition table in MB. Larger values reduce cache thrashing when using multiple threads. A good rule of thumb is ~64MB per thread.
+
+```
+setoption name Hash value 256
+```
+
 ### `Threads` (default: 1, range: 1–256)
 
-Sets the number of search threads. Uses Lazy SMP — all threads search the same position independently and share a transposition table, improving strength on multi-core hardware.
+Sets the number of search threads. Uses Lazy SMP — worker threads run persistently between moves, sharing a transposition table with staggered search depths to pre-fill the TT for the main thread.
 
 ```
 setoption name Threads value 4
 ```
 
-Set this before sending `go`. A value of `1` is identical to the original single-threaded behaviour.
+Set this before sending `go`. A value of `1` is identical to single-threaded behaviour. Be mindful of your CPU's logical thread count — running two concurrent games with 4 threads each uses 8 threads total.
 
 ### `overhead` (default: 100, range: 0–10000)
 
@@ -55,6 +63,7 @@ setoption name overhead value 50
 ```
 uci
 setoption name Threads value 4
+setoption name Hash value 256
 isready
 position startpos
 go movetime 5000
@@ -62,13 +71,16 @@ go movetime 5000
 
 ## Testing with cutechess-cli
 
-To run a match between single-threaded and 4-thread versions:
+To run a match between 1T, 2T, and 4T versions:
 
 ```sh
 cutechess-cli \
-  -engine name=Cep1T cmd=./Cepimetheus-Hydra option.Threads=1 \
-  -engine name=Cep4T cmd=./Cepimetheus-Hydra option.Threads=4 \
+  -engine name=Hydra-1T cmd=./Cepimetheus-Hydra option.Threads=1 option.Hash=64 \
+  -engine name=Hydra-2T cmd=./Cepimetheus-Hydra option.Threads=2 option.Hash=128 \
+  -engine name=Hydra-4T cmd=./Cepimetheus-Hydra option.Threads=4 option.Hash=256 \
   -each proto=uci tc=10+0.1 \
-  -games 400 -concurrency 2 -repeat \
+  -games 2 -rounds 10 -repeat -concurrency 2 \
   -pgnout results.pgn
 ```
+
+On a 6-core/12-thread CPU, keep `Threads × concurrency ≤ 10` to avoid oversubscription.
