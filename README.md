@@ -1,6 +1,8 @@
-# Cepimetheus
+# Cepimetheus-Hydra
 
-My C# engine Epimetheus remade in C. I had numerous issues with the Epimetheus codebase, so this is the new continuation, the C# version can be mostly considered dead.
+George's C# engine Epimetheus remade in C. He had numerous issues with the Epimetheus codebase, so this is the new continuation, the C# version can be mostly considered dead.
+
+I have used Claude to (hopefully) very lazily add multithreading.
 
 ## Build
 
