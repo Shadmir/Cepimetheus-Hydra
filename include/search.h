@@ -33,7 +33,7 @@ typedef void (*SearchMoveInfoCallback)(int depth,
                                        float score,
                                        void *user_data);
 
-SearchContext *search_context_create(void);
+SearchContext *search_context_create(int hash_mb); /* hash_mb: TT size in MB, 0 = default (64) */
 void search_context_destroy(SearchContext *context);
 
 SearchResult search_root(Board *board,

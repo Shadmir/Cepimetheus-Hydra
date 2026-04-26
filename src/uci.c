@@ -251,6 +251,7 @@ void uci_loop(void) {
     SearchOptions options;
     options.overhead_ms = 100;
     options.threads = 1;
+    options.hash_mb = 64;
 
     SmpThreadPool *thread_pool = smp_thread_pool_create(0); /* 0 workers until Threads is set */
     int pool_threads = 1; /* tracks options.threads so we know when to recreate the pool */
@@ -265,6 +266,7 @@ void uci_loop(void) {
         if (strncmp(line, "uci", 3) == 0 && (line[3] == '\0' || line[3] == ' ' || line[3] == '\t' || line[3] == '\r' || line[3] == '\n')) {
             printf("id name Cepimetheus-Hydra\n");
             printf("id author David Vaughan & George Bland\n");
+            printf("option name Hash type spin default 64 min 1 max 65536\n");
             printf("option name overhead type spin default 100 min 0 max 10000\n");
             printf("option name Threads type spin default 1 min 1 max 256\n");
             printf("uciok\n");
@@ -286,7 +288,14 @@ void uci_loop(void) {
                 nametoken += 4;
                 while (*nametoken == ' ' || *nametoken == '\t') nametoken++;
                 
-                if (strncmp(nametoken, "overhead", 8) == 0 && valuetoken != NULL) {
+                if (strncmp(nametoken, "Hash", 4) == 0 && valuetoken != NULL) {
+                    valuetoken += 5;
+                    while (*valuetoken == ' ' || *valuetoken == '\t') valuetoken++;
+                    int parsed_hash = atoi(valuetoken);
+                    if (parsed_hash >= 1 && parsed_hash <= 65536) {
+                        options.hash_mb = parsed_hash;
+                    }
+                } else if (strncmp(nametoken, "overhead", 8) == 0 && valuetoken != NULL) {
                     valuetoken += 5;
                     while (*valuetoken == ' ' || *valuetoken == '\t') valuetoken++;
                     int parsed_overhead = atoi(valuetoken);

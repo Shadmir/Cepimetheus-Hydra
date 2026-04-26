@@ -312,7 +312,8 @@ Move think(Board *board,
         control.hard_stop_time_ms = start_time_ms + (long long)hard_time_limit_ms;
     }
 
-    SearchContext *search_context = search_context_create();
+    int hash_mb = (options != NULL && options->hash_mb > 0) ? options->hash_mb : 0;
+    SearchContext *search_context = search_context_create(hash_mb);
 
     /* Lazy SMP: signal persistent worker threads to start searching */
     volatile bool smp_stop = false;
@@ -324,8 +325,9 @@ Move think(Board *board,
         w->board       = *board;
         w->history     = search_history;
         w->context     = search_context;
-        w->control     = (SearchControl){0};
-        w->smp_stop    = &smp_stop;
+        w->control                 = (SearchControl){0};
+        w->control.external_stop  = &smp_stop;
+        w->smp_stop                = &smp_stop;
         w->start_depth = 1 + (i % 3); /* stagger: depths 1, 2, 3, 1, 2, 3... */
         w->total_nodes = 0;
         w->should_search = true;

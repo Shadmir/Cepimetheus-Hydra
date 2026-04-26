@@ -8,7 +8,7 @@
 #include <string.h>
 #include <sys/time.h>
 
-#define TRANSITION_TABLE_SIZE (1U << 20) /* 1 million entries */
+#define TRANSITION_TABLE_DEFAULT_MB 64
 #define MAX_ORDERED_MOVES 256
 
 typedef struct {
@@ -451,13 +451,22 @@ static SearchResult negamax(Board *board,
     return result;
 }
 
-SearchContext *search_context_create(void) {
+SearchContext *search_context_create(int hash_mb) {
     SearchContext *context = calloc(1, sizeof(*context));
     if (context == NULL) {
         return NULL;
     }
 
-    context->table.size = TRANSITION_TABLE_SIZE;
+    if (hash_mb <= 0) {
+        hash_mb = TRANSITION_TABLE_DEFAULT_MB;
+    }
+
+    size_t bytes = (size_t)hash_mb * 1024ULL * 1024ULL;
+    context->table.size = bytes / sizeof(TranspositionEntry);
+    if (context->table.size < 1) {
+        context->table.size = 1;
+    }
+
     context->table.entries = calloc(context->table.size, sizeof(*context->table.entries));
     return context;
 }
