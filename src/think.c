@@ -471,7 +471,28 @@ Move think(Board *board,
             worker_control.stop = false;
             control.stop = false;
 
-            /* Signal workers to start this depth */
+            /* Serial first move: main thread searches move[0] alone so all
+             * subsequent moves start with a real alpha bound rather than -FLT_MAX.
+             * This dramatically improves cut-offs for parallel workers. */
+            SearchStats main_stats = {0ULL, depth};
+            {
+                Move first_move = root_state.ordered_moves[0];
+                SearchResult r = search_root_evaluate_move(
+                    &root_state.board, first_move, depth,
+                    -FLT_MAX, FLT_MAX,
+                    &root_state.history, &main_stats, search_context, &control);
+                if (r.move != MOVE_NONE) {
+                    root_state.best_score     = r.score;
+                    root_state.best_move      = first_move;
+                    root_state.best_pv_length = 0;
+                    for (int i = 0; i < r.pv_length && root_state.best_pv_length < MAX_PV_MOVES; ++i) {
+                        root_state.best_pv[root_state.best_pv_length++] = r.pv[i];
+                    }
+                }
+                root_state.next_move_idx = 1; /* workers start from move[1] */
+            }
+
+            /* Signal workers to drain the remaining moves */
             for (int i = 0; i < num_workers; i++) {
                 SmpWorker *w = &pool->workers[i];
                 pthread_mutex_lock(&w->mutex);
@@ -482,8 +503,7 @@ Move think(Board *board,
                 pthread_mutex_unlock(&w->mutex);
             }
 
-            /* Main thread also drains the queue */
-            SearchStats main_stats = {0ULL, depth};
+            /* Main thread continues draining remaining moves alongside workers */
             drain_root_move_queue(&root_state, &control, &main_stats);
 
             /* Wait for all workers to finish this depth */
