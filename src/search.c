@@ -9,7 +9,6 @@
 #include <sys/time.h>
 
 #define TRANSITION_TABLE_DEFAULT_MB 64
-#define MAX_ORDERED_MOVES 256
 
 typedef struct {
     Move move;
@@ -582,6 +581,85 @@ SearchResult search_root(Board *board,
 
     if ((control == NULL || !control->stop) && result.move != MOVE_NONE) {
         transposition_table_store(table, hash, depth, result.score, TT_EXACT, result.move);
+    }
+
+    return result;
+}
+
+/* ---------- Parallel root search helpers ---------- */
+
+int search_root_generate_moves(Board *board, SearchContext *context,
+                                Move ordered_moves[MAX_ORDERED_MOVES]) {
+    if (board == NULL || ordered_moves == NULL) {
+        return 0;
+    }
+
+    MoveList list;
+    movegen_generate_legal(board, &list);
+    if (list.count == 0) {
+        return 0;
+    }
+
+    TranspositionTable *table = NULL;
+    if (context != NULL && context->table.entries != NULL) {
+        table = &context->table;
+    }
+
+    Move tt_move = MOVE_NONE;
+    if (table != NULL) {
+        U64 hash = board_position_key(board);
+        const TranspositionEntry *tt = transposition_table_lookup(table, hash);
+        if (tt != NULL) {
+            tt_move = tt->best_move;
+        }
+    }
+
+    return build_ordered_moves(board, &list, tt_move, ordered_moves);
+}
+
+SearchResult search_root_evaluate_move(const Board *board, Move move, int depth,
+                                        float alpha, float beta,
+                                        const RepetitionHistory *history,
+                                        SearchStats *stats,
+                                        SearchContext *context,
+                                        SearchControl *control) {
+    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
+
+    if (board == NULL || move == MOVE_NONE) {
+        return result;
+    }
+
+    TranspositionTable *table = NULL;
+    if (context != NULL && context->table.entries != NULL) {
+        table = &context->table;
+    }
+
+    /* Each thread works on its own local copies — safe for concurrent calls */
+    Board local_board = *board;
+    RepetitionHistory local_history = history != NULL ? *history
+                                                      : (RepetitionHistory){0};
+    Undo undo;
+
+    if (!board_make_move(&local_board, move, &undo)) {
+        return result;
+    }
+
+    U64 key = board_position_key(&local_board);
+    if (!repetition_history_push(&local_history, key)) {
+        board_unmake_move(&local_board, &undo);
+        return result;
+    }
+
+    SearchResult child = negamax(&local_board, depth - 1, -beta, -alpha,
+                                  &local_history, stats, 1, table, control);
+    float score = -child.score;
+
+    result.score     = score;
+    result.move      = move;
+    result.pv[0]     = move;
+    result.pv_length = 1;
+    for (int i = 0; i < child.pv_length && result.pv_length < MAX_PV_MOVES; ++i) {
+        result.pv[result.pv_length++] = child.pv[i];
     }
 
     return result;

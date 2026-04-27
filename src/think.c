@@ -1,10 +1,12 @@
 #include "think.h"
 #include "../include/search.h"
 
+#include <float.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
 
 static int score_to_cp(float score) {
@@ -122,29 +124,94 @@ static bool compute_clock_budget(const Board *board,
 }
 
 
+/* ---------- Parallel root move search ---------- */
+
+/*
+ * Shared state for one depth iteration. The main thread populates the move
+ * queue and resets this before signalling workers. All threads (main + workers)
+ * drain the queue concurrently: each grabs one move, searches it, reports back.
+ * The mutex protects the queue index and the best-result fields.
+ */
+typedef struct {
+    pthread_mutex_t mutex;
+
+    /* Move queue — populated once per depth by main thread */
+    Move ordered_moves[MAX_ORDERED_MOVES];
+    int  num_moves;
+    int  next_move_idx; /* next unassigned slot */
+
+    /* Rolling best result — updated under mutex as threads finish moves */
+    float best_score;
+    Move  best_move;
+    Move  best_pv[MAX_PV_MOVES];
+    int   best_pv_length;
+
+    /* Read-only inputs — workers make local copies before modifying */
+    Board             board;
+    RepetitionHistory history;
+    SearchContext    *context;
+    int               depth;
+    volatile bool    *stop; /* points to think()'s smp_stop */
+} ParallelRootState;
+
+static void drain_root_move_queue(ParallelRootState *state,
+                                  SearchControl *control,
+                                  SearchStats *stats) {
+    for (;;) {
+        pthread_mutex_lock(&state->mutex);
+        bool ext_stop  = (state->stop != NULL && *state->stop);
+        bool ctrl_stop = (control != NULL && control->stop);
+        if (ext_stop || ctrl_stop || state->next_move_idx >= state->num_moves) {
+            /* Propagate hard-time-limit stop to all other threads */
+            if (ctrl_stop && state->stop != NULL) {
+                *state->stop = true;
+            }
+            pthread_mutex_unlock(&state->mutex);
+            break;
+        }
+        int   idx      = state->next_move_idx++;
+        float my_alpha = state->best_score; /* lazy: use current best as alpha */
+        pthread_mutex_unlock(&state->mutex);
+
+        Move move = state->ordered_moves[idx];
+        SearchResult r = search_root_evaluate_move(
+            &state->board, move, state->depth,
+            my_alpha, FLT_MAX,
+            &state->history, stats, state->context, control);
+
+        if (r.move == MOVE_NONE) {
+            continue;
+        }
+
+        pthread_mutex_lock(&state->mutex);
+        if (r.score > state->best_score || state->best_move == MOVE_NONE) {
+            state->best_score     = r.score;
+            state->best_move      = move;
+            state->best_pv[0]     = move;
+            state->best_pv_length = 1;
+            for (int i = 0; i < r.pv_length && state->best_pv_length < MAX_PV_MOVES; ++i) {
+                state->best_pv[state->best_pv_length++] = r.pv[i];
+            }
+        }
+        pthread_mutex_unlock(&state->mutex);
+    }
+}
+
 /* ---------- Persistent SMP thread pool ---------- */
 
 typedef struct {
     pthread_t       thread;
     pthread_mutex_t mutex;
-    pthread_cond_t  start_cond;   /* main  → worker: new search ready */
-    pthread_cond_t  done_cond;    /* worker → main:  search finished  */
+    pthread_cond_t  start_cond; /* main → worker: depth ready */
+    pthread_cond_t  done_cond;  /* worker → main: depth done  */
 
-    /* Task data written by main before signalling start_cond */
-    Board              board;
-    RepetitionHistory  history;
-    SearchContext     *context;   /* shared TT, not owned */
+    ParallelRootState *root_state; /* set by main before each depth signal */
     SearchControl      control;
-    int                start_depth;
-    volatile bool     *smp_stop;  /* points into think()'s stack frame */
+    SearchStats        stats;      /* per-worker stats for the current depth */
 
-    /* State flags (protected by mutex) */
     bool should_search;
     bool is_searching;
     bool quit;
-
-    /* Output written by worker after each search */
-    unsigned long long total_nodes;
 } SmpWorker;
 
 struct SmpThreadPool {
@@ -160,30 +227,16 @@ static void *smp_worker_main(void *arg) {
         while (!w->should_search && !w->quit) {
             pthread_cond_wait(&w->start_cond, &w->mutex);
         }
-        bool do_quit = w->quit;
+        bool do_quit    = w->quit;
         w->is_searching = !do_quit;
         pthread_mutex_unlock(&w->mutex);
 
         if (do_quit) break;
 
-        unsigned long long total_nodes = 0;
-        SearchStats stats = {0};
-        int start = w->start_depth > 0 ? w->start_depth : 1;
-        for (int depth = start; depth < INT_MAX; depth++) {
-            bool should_stop = w->control.stop;
-            if (!should_stop && w->smp_stop != NULL) {
-                should_stop = *w->smp_stop;
-            }
-            if (should_stop) break;
-            stats.nodes = 0;
-            search_root(&w->board, depth, &w->history, &stats,
-                        w->context, &w->control, NULL, NULL);
-            total_nodes += stats.nodes;
-            if (w->control.stop) break;
-        }
+        w->stats = (SearchStats){0};
+        drain_root_move_queue(w->root_state, &w->control, &w->stats);
 
         pthread_mutex_lock(&w->mutex);
-        w->total_nodes   = total_nodes;
         w->should_search = false;
         w->is_searching  = false;
         pthread_cond_signal(&w->done_cond);
@@ -315,121 +368,181 @@ Move think(Board *board,
     int hash_mb = (options != NULL && options->hash_mb > 0) ? options->hash_mb : 0;
     SearchContext *search_context = search_context_create(hash_mb);
 
-    /* Lazy SMP: signal persistent worker threads to start searching */
-    volatile bool smp_stop = false;
     int num_workers = (pool != NULL) ? pool->num_workers : 0;
 
-    for (int i = 0; i < num_workers; i++) {
-        SmpWorker *w = &pool->workers[i];
-        pthread_mutex_lock(&w->mutex);
-        w->board       = *board;
-        w->history     = search_history;
-        w->context     = search_context;
-        w->control                 = (SearchControl){0};
-        w->control.external_stop  = &smp_stop;
-        w->smp_stop                = &smp_stop;
-        w->start_depth = 1 + (i % 3); /* stagger: depths 1, 2, 3, 1, 2, 3... */
-        w->total_nodes = 0;
-        w->should_search = true;
-        pthread_cond_signal(&w->start_cond);
-        pthread_mutex_unlock(&w->mutex);
-    }
-
     SearchResult best_result = {0.0f, MOVE_NONE, {0}, 0, false};
-    SearchResult result = {0.0f, MOVE_NONE, {0}, 0, false};
 
-    /* Iterative deepening: search depths 1 through target_depth. */
     int depth_limit = target_depth;
     if (infinite_search && !depth_explicitly_set && !time_limited && movetime_ms <= 0) {
         depth_limit = INT_MAX;
     }
 
-    for (int depth = 1; depth <= depth_limit; ++depth) {
-        if (stop_signal != NULL && *stop_signal) {
-            smp_stop = true;
-            break;
-        }
-
-        if (time_limited) {
-            long long elapsed_before_depth_ms = current_time_ms() - start_time_ms;
-            if (elapsed_before_depth_ms < 0) {
-                elapsed_before_depth_ms = 0;
+    if (num_workers == 0) {
+        /* ---- Single-threaded path (unchanged behaviour) ---- */
+        for (int depth = 1; depth <= depth_limit; ++depth) {
+            if (stop_signal != NULL && *stop_signal) {
+                break;
             }
 
-            if (elapsed_before_depth_ms >= soft_time_limit_ms && best_result.move != MOVE_NONE) {
+            if (time_limited) {
+                long long elapsed_before = current_time_ms() - start_time_ms;
+                if (elapsed_before < 0) elapsed_before = 0;
+                if (elapsed_before >= soft_time_limit_ms && best_result.move != MOVE_NONE) {
+                    break;
+                }
+            }
+
+            SearchStats stats = {0ULL, depth};
+            control.stop = false;
+
+            SearchResult result = search_root(board, depth, &search_history,
+                                              &stats, search_context, &control,
+                                              print_move_info_callback, NULL);
+
+            if (control.stop) break;
+
+            long long elapsed_ms = current_time_ms() - start_time_ms;
+            if (elapsed_ms < 0) elapsed_ms = 0;
+
+            print_depth_info(depth, &result, &stats, elapsed_ms);
+
+            if (result.move != MOVE_NONE) {
+                best_result = result;
+            }
+
+            if (result.forced_root_move) break;
+
+            if (time_limited && elapsed_ms >= soft_time_limit_ms) break;
+        }
+    } else {
+        /* ---- Parallel root-move search ---- */
+        volatile bool smp_stop = false;
+
+        ParallelRootState root_state;
+        memset(&root_state, 0, sizeof(root_state));
+        pthread_mutex_init(&root_state.mutex, NULL);
+        root_state.board   = *board;
+        root_state.history = search_history;
+        root_state.context = search_context;
+        root_state.stop    = &smp_stop;
+
+        /* Worker control: external_stop wired to smp_stop so workers abort
+         * immediately when the main thread signals stop. */
+        SearchControl worker_control = control;
+        worker_control.external_stop = &smp_stop;
+
+        for (int depth = 1; depth <= depth_limit; ++depth) {
+            if (stop_signal != NULL && *stop_signal) {
+                smp_stop = true;
+                break;
+            }
+
+            if (time_limited) {
+                long long elapsed_before = current_time_ms() - start_time_ms;
+                if (elapsed_before < 0) elapsed_before = 0;
+                if (elapsed_before >= soft_time_limit_ms && best_result.move != MOVE_NONE) {
+                    smp_stop = true;
+                    break;
+                }
+            }
+
+            /* Populate the move queue for this depth */
+            pthread_mutex_lock(&root_state.mutex);
+            root_state.depth          = depth;
+            root_state.next_move_idx  = 0;
+            root_state.best_score     = -FLT_MAX;
+            root_state.best_move      = MOVE_NONE;
+            root_state.best_pv_length = 0;
+            root_state.num_moves = search_root_generate_moves(
+                board, search_context, root_state.ordered_moves);
+            pthread_mutex_unlock(&root_state.mutex);
+
+            /* Forced/no-move cases */
+            if (root_state.num_moves == 0) break;
+            if (root_state.num_moves == 1) {
+                if (best_result.move == MOVE_NONE) {
+                    best_result.move = root_state.ordered_moves[0];
+                }
+                best_result.forced_root_move = true;
+                smp_stop = true;
+                break;
+            }
+
+            /* Reset worker control stop flag */
+            worker_control.stop = false;
+            control.stop = false;
+
+            /* Signal workers to start this depth */
+            for (int i = 0; i < num_workers; i++) {
+                SmpWorker *w = &pool->workers[i];
+                pthread_mutex_lock(&w->mutex);
+                w->root_state    = &root_state;
+                w->control       = worker_control;
+                w->should_search = true;
+                pthread_cond_signal(&w->start_cond);
+                pthread_mutex_unlock(&w->mutex);
+            }
+
+            /* Main thread also drains the queue */
+            SearchStats main_stats = {0ULL, depth};
+            drain_root_move_queue(&root_state, &control, &main_stats);
+
+            /* Wait for all workers to finish this depth */
+            for (int i = 0; i < num_workers; i++) {
+                SmpWorker *w = &pool->workers[i];
+                pthread_mutex_lock(&w->mutex);
+                while (w->is_searching) {
+                    pthread_cond_wait(&w->done_cond, &w->mutex);
+                }
+                pthread_mutex_unlock(&w->mutex);
+            }
+
+            /* If stopped mid-depth, use best result from previous depth */
+            if (smp_stop || (stop_signal != NULL && *stop_signal)) {
+                break;
+            }
+
+            /* Aggregate stats from all threads */
+            SearchStats total_stats = main_stats;
+            for (int i = 0; i < num_workers; i++) {
+                total_stats.nodes += pool->workers[i].stats.nodes;
+                if (pool->workers[i].stats.seldepth > total_stats.seldepth) {
+                    total_stats.seldepth = pool->workers[i].stats.seldepth;
+                }
+            }
+
+            long long elapsed_ms = current_time_ms() - start_time_ms;
+            if (elapsed_ms < 0) elapsed_ms = 0;
+
+            if (root_state.best_move != MOVE_NONE) {
+                best_result.score     = root_state.best_score;
+                best_result.move      = root_state.best_move;
+                best_result.pv_length = root_state.best_pv_length;
+                memcpy(best_result.pv, root_state.best_pv,
+                       (size_t)root_state.best_pv_length * sizeof(Move));
+                best_result.forced_root_move = false;
+            }
+
+            print_depth_info(depth, &best_result, &total_stats, elapsed_ms);
+
+            if (time_limited && elapsed_ms >= soft_time_limit_ms) {
                 smp_stop = true;
                 break;
             }
         }
 
-        SearchStats stats = {0ULL, depth};
-        control.stop = false;
-
-        result = search_root(board,
-                             depth,
-                             &search_history,
-                             &stats,
-                             search_context,
-                             &control,
-                             print_move_info_callback,
-                             NULL);
-
-        if (control.stop) {
-            smp_stop = true;
-            break;
+        /* Ensure all workers are idle before we free the shared context */
+        smp_stop = true;
+        for (int i = 0; i < num_workers; i++) {
+            SmpWorker *w = &pool->workers[i];
+            pthread_mutex_lock(&w->mutex);
+            while (w->is_searching) {
+                pthread_cond_wait(&w->done_cond, &w->mutex);
+            }
+            pthread_mutex_unlock(&w->mutex);
         }
 
-        long long elapsed_ms = current_time_ms() - start_time_ms;
-        if (elapsed_ms < 0) {
-            elapsed_ms = 0;
-        }
-
-        print_depth_info(depth, &result, &stats, elapsed_ms);
-
-        /* Update best result if we have a valid move */
-        if (result.move != MOVE_NONE) {
-            best_result = result;
-        }
-
-        // If the root search resulted in only one legal move then we can stop searching immediately, no matter the time limits, as we won't find a better move by searching deeper
-        if (result.forced_root_move) {
-            smp_stop = true;
-            break;
-        }
-
-        /* Check if we should stop searching */
-        if (time_limited && elapsed_ms >= soft_time_limit_ms) {
-            smp_stop = true;
-            break;
-        }
-    }
-
-    /* Signal workers to stop and wait for them to finish before destroying shared context */
-    smp_stop = true;
-    unsigned long long worker_nodes = 0;
-    for (int i = 0; i < num_workers; i++) {
-        SmpWorker *w = &pool->workers[i];
-        pthread_mutex_lock(&w->mutex);
-        while (w->is_searching) {
-            pthread_cond_wait(&w->done_cond, &w->mutex);
-        }
-        worker_nodes += w->total_nodes;
-        pthread_mutex_unlock(&w->mutex);
-    }
-
-    /* Print worker thread totals so multi-thread search depth is visible */
-    if (worker_nodes > 0) {
-        long long elapsed_ms = current_time_ms() - start_time_ms;
-        if (elapsed_ms < 0) elapsed_ms = 0;
-        unsigned long long total_nps = elapsed_ms > 0
-            ? (worker_nodes * 1000ULL) / (unsigned long long)elapsed_ms : 0;
-        printf("info string worker_nodes %llu nps %llu\n", worker_nodes, total_nps);
-        fflush(stdout);
-    }
-
-    if (best_result.move == MOVE_NONE) {
-        search_context_destroy(search_context);
-        return MOVE_NONE;
+        pthread_mutex_destroy(&root_state.mutex);
     }
 
     search_context_destroy(search_context);
