@@ -187,8 +187,7 @@ static void drain_root_move_queue(ParallelRootState *state,
         if (r.score > state->best_score || state->best_move == MOVE_NONE) {
             state->best_score     = r.score;
             state->best_move      = move;
-            state->best_pv[0]     = move;
-            state->best_pv_length = 1;
+            state->best_pv_length = 0;
             for (int i = 0; i < r.pv_length && state->best_pv_length < MAX_PV_MOVES; ++i) {
                 state->best_pv[state->best_pv_length++] = r.pv[i];
             }
